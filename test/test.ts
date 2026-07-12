@@ -23,7 +23,6 @@ import {
   seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellQuote } from "../pi-extension/subagents/terminal.ts";
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
@@ -47,8 +46,35 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  buildCompletionSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import {
+  createLifecycle,
+  lifecycleTransition,
+  markCompleted,
+  markCompletionDetected,
+  markFailed,
+  markInterruptRequested,
+  observeActivity as observeLifecycleActivity,
+  observePaneInspection,
+  projectLifecycle,
+} from "../pi-extension/subagents/lifecycle.ts";
+
+// Tool-registration behavior is environment-sensitive for child subagents.
+// Isolate the unit suite from inherited parent/child capability variables.
+const inheritedSubagentId = process.env.PI_SUBAGENT_ID;
+const inheritedDenyTools = process.env.PI_DENY_TOOLS;
+before(() => {
+  delete process.env.PI_SUBAGENT_ID;
+  delete process.env.PI_DENY_TOOLS;
+});
+after(() => {
+  if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
+  else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
+  if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
+  else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+});
 
 // --- Helpers ---
 
@@ -1286,6 +1312,200 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError([]), null);
     });
   });
+
+  describe("buildCompletionSidecar", () => {
+    it("emits done immediately for a normal auto-exit completion", () => {
+      assert.deepEqual(buildCompletionSidecar([
+        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+      ]), { type: "done" });
+    });
+
+    it("preserves provider errors in the immediate completion sidecar", () => {
+      assert.deepEqual(buildCompletionSidecar([
+        { role: "assistant", stopReason: "error", errorMessage: "provider failed" },
+      ]), {
+        type: "error",
+        errorMessage: "provider failed",
+        stopReason: "error",
+      });
+    });
+  });
+});
+
+describe("lifecycle.ts", () => {
+  const activity = (overrides: Record<string, unknown> = {}) => ({
+    version: 1 as const,
+    runningChildId: "child",
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    sequence: 1,
+    latestEvent: "agent_start" as const,
+    phase: "active" as const,
+    agentActive: true,
+    turnActive: true,
+    providerActive: false,
+    toolActive: false,
+    activeScope: "agent" as const,
+    activeSince: 2_000,
+    ...overrides,
+  });
+
+  it("interrupts only the turn and keeps process runtime open", () => {
+    const running = observeLifecycleActivity(createLifecycle(1_000), { ok: true, activity: activity() }, 2_000);
+    const interrupted = markInterruptRequested(running, 3_000);
+    const projection = projectLifecycle(interrupted, 8_000);
+    assert.equal(interrupted.process.kind, "running");
+    assert.equal(interrupted.turn.kind, "interrupted");
+    assert.equal(projection.runtimeEndedAt, undefined);
+  });
+
+  it("rejects stale activity after interrupt and accepts a newer sequence", () => {
+    const running = observeLifecycleActivity(createLifecycle(1_000), { ok: true, activity: activity() }, 2_000);
+    const interrupted = markInterruptRequested(running, 3_000);
+    const stale = observeLifecycleActivity(interrupted, { ok: true, activity: activity({ updatedAt: 3_000 }) }, 3_100);
+    assert.equal(stale.turn.kind, "interrupted");
+    const resumed = observeLifecycleActivity(stale, {
+      ok: true,
+      activity: activity({ updatedAt: 3_000, sequence: 2, activeSince: 3_000 }),
+    }, 3_100);
+    assert.equal(resumed.turn.kind, "active");
+  });
+
+  it("makes finalizing and terminal process states irreversible", () => {
+    const running = observeLifecycleActivity(createLifecycle(1_000), { ok: true, activity: activity() }, 2_000);
+    const finalizing = markCompletionDetected(running, { reason: "done", exitCode: 0 }, 4_000);
+    const ignored = observeLifecycleActivity(finalizing, {
+      ok: true,
+      activity: activity({ updatedAt: 5_000, sequence: 9 }),
+    }, 5_000);
+    assert.equal(ignored.process.kind, "finalizing");
+    assert.deepEqual(projectLifecycle(ignored, 9_000), { kind: "finalizing", runtimeEndedAt: 4_000 });
+    const completed = markCompleted(ignored, 6_000);
+    assert.equal(markFailed(completed, "late failure", 7_000).process.kind, "completed");
+  });
+
+  it("projects confirmed running without turn detail as running, not starting", () => {
+    const started = createLifecycle(1_000);
+    const running = {
+      ...started,
+      process: { kind: "running" as const, startedAt: 1_000, confirmedAt: 1_500 },
+    };
+    assert.deepEqual(projectLifecycle(running, 3_000), { kind: "running" });
+  });
+
+  it("detects stalled and recovered transitions from lifecycle projections", () => {
+    assert.equal(lifecycleTransition("active", "stalled"), "stalled");
+    assert.equal(lifecycleTransition("stalled", "waiting"), "recovered");
+    assert.equal(lifecycleTransition("stalled", "active"), "recovered");
+    assert.equal(lifecycleTransition("stalled", "blocked"), "recovered");
+    assert.equal(lifecycleTransition("stalled", "interrupted"), "recovered");
+    assert.equal(lifecycleTransition("waiting", "active"), null);
+  });
+
+  it("does not interpret initial idle as completion", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "idle" }, 2_000);
+    assert.equal(projectLifecycle(lifecycle, 3_000).kind, "starting");
+    assert.equal(lifecycle.turn.kind, "starting");
+  });
+
+  it("treats working then idle as waiting", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    assert.equal(projectLifecycle(lifecycle, 2_500).kind, "active");
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 3_000, agentStatus: "idle" }, 3_000);
+    assert.equal(projectLifecycle(lifecycle, 4_000).kind, "waiting");
+  });
+
+  it("preserves state entry time across repeated herdr observations", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 3_000, agentStatus: "working" }, 3_000);
+    assert.equal(projectLifecycle(lifecycle, 4_000).stateDurationSince, 2_000);
+
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 5_000, agentStatus: "blocked" }, 5_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 6_000, agentStatus: "blocked" }, 6_000);
+    assert.equal(projectLifecycle(lifecycle, 7_000).stateDurationSince, 5_000);
+
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 8_000, agentStatus: "idle" }, 8_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 9_000, agentStatus: "done" }, 9_000);
+    assert.equal(projectLifecycle(lifecycle, 10_000).stateDurationSince, 8_000);
+  });
+
+  it("does not enter finalizing from herdr idle/done", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 3_000, agentStatus: "done" }, 3_000);
+    assert.equal(lifecycle.process.kind, "running");
+    assert.notEqual(projectLifecycle(lifecycle, 4_000).kind, "finalizing");
+  });
+
+  it("projects blocked when herdr reports blocked", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "blocked" }, 2_000);
+    assert.equal(projectLifecycle(lifecycle, 3_000).kind, "blocked");
+  });
+
+  it("treats missing pane as pane observation but not immediate failure", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_000);
+    assert.equal(lifecycle.pane.kind, "missing");
+    assert.equal(lifecycle.process.kind, "running");
+  });
+
+  it("preserves local interrupt over stale herdr statuses", () => {
+    for (const agentStatus of ["working", "blocked", "idle", "done"] as const) {
+      let lifecycle = createLifecycle(1_000);
+      lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+      lifecycle = markInterruptRequested(lifecycle, 3_000);
+      lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 3_100, agentStatus }, 3_100);
+      assert.equal(projectLifecycle(lifecycle, 4_000).kind, "interrupted", agentStatus);
+    }
+  });
+
+  it("preserves hasWorked across unavailable observations", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "unavailable", error: "socket" }, 2_500);
+    lifecycle = observePaneInspection(lifecycle, { kind: "unavailable", error: "socket" }, 2_600);
+    assert.equal(lifecycle.pane.kind, "read-error");
+    assert.equal(lifecycle.pane.kind === "read-error" ? lifecycle.pane.consecutiveFailures : 0, 2);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 3_000, agentStatus: "idle" }, 3_000);
+    assert.equal(projectLifecycle(lifecycle, 4_000).kind, "waiting");
+  });
+
+  it("does not let missing activity detail stall healthy herdr working", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observeLifecycleActivity(lifecycle, { ok: false, reason: "missing" }, 3_000);
+    assert.equal(projectLifecycle(lifecycle, 120_000).kind, "active");
+  });
+
+  it("uses activity only as detail and does not override herdr waiting", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 3_000, agentStatus: "idle" }, 3_000);
+    lifecycle = observeLifecycleActivity(lifecycle, { ok: true, activity: activity({ updatedAt: 3_100, sequence: 2 }) }, 3_100);
+    assert.equal(projectLifecycle(lifecycle, 4_000).kind, "waiting");
+  });
+
+  it("preserves activity detail duration across repeated updates", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observeLifecycleActivity(lifecycle, {
+      ok: true,
+      activity: activity({ updatedAt: 2_100, sequence: 1, activeSince: 2_000, activeScope: "tool", toolName: "bash", toolStartedAt: 2_000 }),
+    }, 2_100);
+    lifecycle = observeLifecycleActivity(lifecycle, {
+      ok: true,
+      activity: activity({ updatedAt: 3_000, sequence: 2, activeSince: 2_000, activeScope: "tool", toolName: "bash", toolStartedAt: 2_000 }),
+    }, 3_000);
+    const projection = projectLifecycle(lifecycle, 4_000);
+    assert.equal(projection.kind, "active");
+    assert.equal(projection.label, "bash");
+    assert.equal(projection.stateDurationSince, 2_000);
+  });
 });
 
 describe("completion.ts", () => {
@@ -1330,9 +1550,13 @@ describe("completion.ts", () => {
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  it("rejects unknown completion sidecar payloads", () => {
+    for (const payload of [{}, null]) {
+      const result = interpretExitSidecar(payload);
+      assert.equal(result.reason, "error");
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage ?? "", /Invalid subagent completion sidecar/);
+    }
   });
 
   it("consumes a sidecar and removes it", async () => {
@@ -1400,6 +1624,106 @@ describe("completion.ts", () => {
     assert.equal(ticks, 1);
   });
 
+  it("returns a failure when the pane explicitly disappears", async () => {
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => { throw new Error("pane read failed"); },
+      inspectPane: async () => ({ kind: "missing", error: "pane_not_found" }),
+      paneDisappearanceGraceMs: 0,
+    });
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
+    });
+  });
+
+  it("lets a sidecar win the pane-disappearance race", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-race-"));
+    const sessionFile = join(dir, "child.jsonl");
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "",
+        inspectPane: async () => {
+          writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+          return { kind: "missing", error: "pane_not_found" };
+        },
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("waits briefly for delayed sidecar publication after pane disappearance", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-delayed-race-"));
+    const sessionFile = join(dir, "child.jsonl");
+    const timer = setTimeout(() => {
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+    }, 30);
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "",
+        inspectPane: async () => ({ kind: "missing", error: "pane_not_found" }),
+        paneDisappearanceGraceMs: 150,
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+    } finally {
+      clearTimeout(timer);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an ambiguous pane read failure retryable while the pane exists", async () => {
+    let reads = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        if (reads === 1) throw new Error("socket unavailable");
+        return "__SUBAGENT_DONE_0__";
+      },
+      inspectPane: async () => ({ kind: "present", observedAt: 0, agentStatus: "working" }),
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(reads, 2);
+  });
+
+  it("treats presence-check throws as unknown and keeps polling", async () => {
+    let reads = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        if (reads === 1) throw new Error("pane read failed");
+        return "__SUBAGENT_DONE_0__";
+      },
+      inspectPane: async () => { throw new Error("herdr list failed"); },
+    });
+    assert.equal(result.exitCode, 0);
+    assert.equal(reads, 2);
+  });
+
+  it("inspects herdr status even when terminal reads succeed", async () => {
+    let reads = 0;
+    const inspections: string[] = [];
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads === 1 ? "shell output" : "__SUBAGENT_DONE_0__";
+      },
+      inspectPane: async () => ({ kind: "present", observedAt: 2_000, agentStatus: "blocked" }),
+      onPaneInspection: (inspection) => inspections.push(inspection.kind === "present" ? inspection.agentStatus : inspection.kind),
+    });
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(inspections, ["blocked"]);
+  });
+
   it("rejects promptly when aborted", async () => {
     const controller = new AbortController();
     const completion = waitForCompletion(controller.signal, {
@@ -1429,6 +1753,34 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("ignores an inherited deny list in a parent process", () => {
+    delete process.env.PI_SUBAGENT_ID;
+    process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt,subagent_resume,subagents_list";
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      assert.equal(registeredTools.some((tool) => tool.name === "subagent"), true);
+      assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+    } finally {
+      delete process.env.PI_DENY_TOOLS;
+    }
+  });
+
+  it("applies the deny list inside a child subagent process", () => {
+    process.env.PI_SUBAGENT_ID = "child-test";
+    process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt";
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      assert.equal(registeredTools.some((tool) => tool.name === "subagent"), false);
+      assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), false);
+      assert.equal(registeredTools.some((tool) => tool.name === "subagents_list"), true);
+    } finally {
+      delete process.env.PI_SUBAGENT_ID;
+      delete process.env.PI_DENY_TOOLS;
+    }
+  });
+
   it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
     const testApi = (subagentsModule as any).__test__;
 
@@ -1488,7 +1840,10 @@ describe("tool registration", () => {
 describe("subagent parent lifecycle", () => {
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
-    const agents = new Map([["child", { abortController }]]);
+    const agents = new Map([["child", {
+      abortController,
+      lifecycle: createLifecycle(1_000),
+    }]]);
 
     cleanupSubagentsForShutdown("reload", agents);
 
@@ -1501,16 +1856,37 @@ describe("subagent parent lifecycle", () => {
   it("aborts and clears active subagents during final shutdown", () => {
     for (const reason of ["quit", "new", "resume", "fork", undefined]) {
       const abortController = new AbortController();
-      const running = { abortController };
+      const running = { abortController, lifecycle: createLifecycle(1_000) };
       const agents = new Map([["child", running]]);
 
       cleanupSubagentsForShutdown(reason, agents);
 
       assert.equal(shouldPreserveSubagentsOnShutdown(reason), false);
       assert.equal(abortController.signal.aborted, true);
+      // Delivery is suppressed before the map is cleared so a racing watcher
+      // that still holds a reference cannot deliver after shutdown.
+      assert.equal(running.lifecycle.delivery, "suppressed");
       assert.equal(shouldDeliverSubagentCompletion(running), false);
       assert.equal(agents.size, 0);
     }
+  });
+
+  it("treats lifecycle.delivery as the authoritative completion gate", () => {
+    const pending = { lifecycle: createLifecycle(1_000) };
+    assert.equal(shouldDeliverSubagentCompletion(pending), true);
+
+    const delivered = {
+      lifecycle: { ...createLifecycle(1_000), delivery: "delivered" as const },
+    };
+    assert.equal(shouldDeliverSubagentCompletion(delivered), false);
+
+    const suppressed = {
+      lifecycle: { ...createLifecycle(1_000), delivery: "suppressed" as const },
+    };
+    assert.equal(shouldDeliverSubagentCompletion(suppressed), false);
+
+    // Pre-lifecycle fixtures without a lifecycle field still default to pending.
+    assert.equal(shouldDeliverSubagentCompletion({} as any), true);
   });
 
   it("delivers completion through the reloaded extension API", () => {
@@ -1704,7 +2080,7 @@ describe("subagent interruption", () => {
       startTime: 0,
       sessionFile: "worker.jsonl",
       interactive: false,
-      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      lifecycle: createLifecycle(0),
       ...overrides,
     };
   }
@@ -1762,30 +2138,39 @@ describe("subagent interruption", () => {
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
 
-    const activeState = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 0 }),
+    const activeLifecycle = observeLifecycleActivity(
+      createLifecycle(0),
       {
-        snapshot: "present",
-        updatedAt: 5_000,
-        sequence: 1,
-        phase: "active",
-        active: true,
-        activeScope: "tool",
-        activeSince: 5_000,
-        activityLabel: "bash",
+        ok: true,
+        activity: {
+          version: 1,
+          runningChildId: "a1",
+          createdAt: 0,
+          updatedAt: 5_000,
+          sequence: 1,
+          latestEvent: "tool_execution_start",
+          phase: "active",
+          agentActive: true,
+          turnActive: true,
+          providerActive: false,
+          toolActive: true,
+          activeScope: "tool",
+          activeSince: 5_000,
+          toolName: "bash",
+        },
       },
       5_000,
     );
 
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
       const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
         throw new Error("mux write failed");
       }));
 
       assert.match(result.content[0].text, /Failed to send Escape/);
-      assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
+      assert.equal(projectLifecycle(runningMap.get("a1").lifecycle, 20_000).kind, "active");
     } finally {
       runningMap.clear();
     }
@@ -1841,23 +2226,19 @@ describe("subagent interruption", () => {
       writeFileSync(activityFile, `${JSON.stringify(activity)}\n`);
 
       try {
-        runningMap.set("a1", makeRunning({
-          activityFile,
-          statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
-        }));
+        runningMap.set("a1", makeRunning({ activityFile }));
 
         withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
           sentSurface = surface;
         }));
 
         assert.equal(sentSurface, "pane-1");
-        const state = runningMap.get("a1").statusState;
-        const snapshot = classifyStatus(state, 20_000);
-        assert.equal(snapshot.kind, "waiting");
-        assert.equal(snapshot.activityLabel, "interrupted");
-        assert.equal(state.lastActivityAtMs, 20_000);
-        assert.equal(state.lastActivitySequence, 7);
-        assert.equal(state.localOverrideSequence, 7);
+        const lifecycle = runningMap.get("a1").lifecycle;
+        const projection = projectLifecycle(lifecycle, 20_000);
+        assert.equal(projection.kind, "interrupted");
+        assert.equal(lifecycle.turn.kind, "interrupted");
+        assert.equal(lifecycle.lastActivitySequence, 7);
+        assert.equal(lifecycle.turn.previousActivitySequence, 7);
       } finally {
         runningMap.clear();
       }
@@ -1870,23 +2251,32 @@ describe("subagent interruption", () => {
     let sentSurface = "";
     runningMap.clear();
 
-    const activeState = observeStatus(
-      createStatusState({ source: "pi", startTimeMs: 0 }),
+    const activeLifecycle = observeLifecycleActivity(
+      createLifecycle(0),
       {
-        snapshot: "present",
-        updatedAt: 5_000,
-        sequence: 1,
-        phase: "active",
-        active: true,
-        activeScope: "tool",
-        activeSince: 5_000,
-        activityLabel: "bash",
+        ok: true,
+        activity: {
+          version: 1,
+          runningChildId: "a1",
+          createdAt: 0,
+          updatedAt: 5_000,
+          sequence: 1,
+          latestEvent: "tool_execution_start",
+          phase: "active",
+          agentActive: true,
+          turnActive: true,
+          providerActive: false,
+          toolActive: true,
+          activeScope: "tool",
+          activeSince: 5_000,
+          toolName: "bash",
+        },
       },
       5_000,
     );
 
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
       const result = withMockedNow(20_000, () => testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
         sentSurface = surface;
@@ -1895,9 +2285,8 @@ describe("subagent interruption", () => {
       assert.equal(sentSurface, "pane-1");
       assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
-      const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
-      assert.equal(snapshot.kind, "waiting");
-      assert.equal(snapshot.activityLabel, "interrupted");
+      const projection = projectLifecycle(runningMap.get("a1").lifecycle, 20_000);
+      assert.equal(projection.kind, "interrupted");
       assert.equal(runningMap.has("a1"), true);
     } finally {
       runningMap.clear();
@@ -2105,6 +2494,170 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
+  it("projects Claude agents as running and counts them as active", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const originalNow = Date.now;
+    Date.now = () => 30_000;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([{
+        id: "c1",
+        name: "Claude",
+        task: "",
+        surface: "s1",
+        startTime: 5_000,
+        sessionFile: "sess1",
+        cli: "claude",
+        lifecycle: { ...createLifecycle(5_000), process: { kind: "running", startedAt: 5_000, confirmedAt: 5_000 } },
+        interactive: false,
+      }], 64);
+
+      assert.match(lines[0], /1 active/);
+      assert.ok(lines[0].includes("\x1b[38;2;77;163;255m"));
+      assert.match(lines[1], /running/);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("shows interrupted agents as open while process runtime continues", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const interruptedAt = 20_000;
+    const lifecycle = markInterruptRequested(
+      { ...createLifecycle(5_000), process: { kind: "running", startedAt: 5_000, confirmedAt: 5_000 } },
+      interruptedAt,
+    );
+
+    const originalNow = Date.now;
+    Date.now = () => 30_000;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([{
+        id: "a1",
+        name: "Worker",
+        task: "",
+        surface: "s1",
+        startTime: 5_000,
+        sessionFile: "sess1",
+        lifecycle,
+        interactive: false,
+      }], 64);
+
+      assert.match(lines[0], /1 open/);
+      assert.ok(lines[0].includes("\x1b[38;2;214;158;46m"));
+      assert.match(lines[1], /00:25\s+Worker/);
+      assert.match(lines[1], /interrupted 10s/);
+      assert.doesNotMatch(lines.join("\n"), /running|active/);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("hydrates legacy activity done as waiting, not finalizing", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const doneAt = 20_000;
+    const legacyDone = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: 5_000 }),
+      {
+        snapshot: "present",
+        updatedAt: doneAt,
+        sequence: 1,
+        phase: "done",
+        latestEvent: "subagent_done",
+      },
+      doneAt,
+    );
+    const originalNow = Date.now;
+    Date.now = () => 30_000;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([{
+        id: "legacy",
+        name: "Legacy",
+        task: "",
+        surface: "s1",
+        startTime: 5_000,
+        sessionFile: "sess1",
+        statusState: legacyDone,
+        interactive: false,
+      }], 64);
+      assert.match(lines[1], /waiting/);
+      assert.doesNotMatch(lines[1], /finalizing/);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("freezes runtime when the subagent reports done", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const doneAt = 20_000;
+    const lifecycle = markCompletionDetected(createLifecycle(5_000), { reason: "done", exitCode: 0 }, doneAt);
+
+    const originalNow = Date.now;
+    Date.now = () => 30_000;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([{
+        id: "a1",
+        name: "Reviewer",
+        task: "",
+        surface: "s1",
+        startTime: 5_000,
+        sessionFile: "sess1",
+        lifecycle,
+        interactive: false,
+      }], 64);
+
+      assert.match(lines[0], /1 open/);
+      assert.match(lines[1], /00:15\s+Reviewer/);
+      assert.match(lines[1], /finalizing…/);
+      assert.doesNotMatch(lines[1], /00:25/);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("keeps a blue border and summarizes mixed active and open agents", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const now = 30_000;
+    const active = observeLifecycleActivity(
+      createLifecycle(5_000),
+      {
+        ok: true,
+        activity: {
+          version: 1,
+          runningChildId: "a1",
+          createdAt: 5_000,
+          updatedAt: 29_000,
+          sequence: 1,
+          latestEvent: "agent_start",
+          phase: "active",
+          agentActive: true,
+          turnActive: true,
+          providerActive: false,
+          toolActive: false,
+          activeScope: "agent",
+          activeSince: 29_000,
+        },
+      },
+      29_000,
+    );
+    const interrupted = markInterruptRequested(
+      { ...createLifecycle(10_000), process: { kind: "running", startedAt: 10_000, confirmedAt: 10_000 } },
+      20_000,
+    );
+
+    const originalNow = Date.now;
+    Date.now = () => now;
+    try {
+      const lines = testApi.renderSubagentWidgetLines([
+        { id: "a1", name: "Active", task: "", surface: "s1", startTime: 5_000, sessionFile: "s1", lifecycle: active, interactive: false },
+        { id: "a2", name: "Open", task: "", surface: "s2", startTime: 10_000, sessionFile: "s2", lifecycle: interrupted, interactive: false },
+      ], 72);
+
+      assert.match(lines[0], /1 active · 1 open/);
+      assert.ok(lines[0].includes("\x1b[38;2;77;163;255m"));
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
@@ -2121,7 +2674,7 @@ describe("subagents widget rendering", () => {
           surface: "s1",
           startTime: 1_000_000 - 13_000,
           sessionFile: "sess1",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 13_000 }),
+          lifecycle: createLifecycle(1_000_000 - 13_000),
         },
         {
           id: "a2",
@@ -2130,7 +2683,7 @@ describe("subagents widget rendering", () => {
           surface: "s2",
           startTime: 1_000_000 - 21_000,
           sessionFile: "sess2",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 21_000 }),
+          lifecycle: createLifecycle(1_000_000 - 21_000),
         },
         {
           id: "a3",
@@ -2139,7 +2692,7 @@ describe("subagents widget rendering", () => {
           surface: "s3",
           startTime: 1_000_000 - 27_000,
           sessionFile: "sess3",
-          statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
+          lifecycle: createLifecycle(1_000_000 - 27_000),
         },
       ], 16);
 
@@ -2177,7 +2730,7 @@ describe("subagents widget rendering", () => {
           surface: "s1",
           startTime,
           sessionFile: "sess1",
-          statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+          lifecycle: createLifecycle(startTime),
         },
       ], width);
 
@@ -2228,6 +2781,57 @@ describe("herdr.ts", () => {
         () => __herdrTest__.extractHerdrPaneId("not json", "pane split"),
         /Unexpected herdr pane split output/,
       );
+    });
+
+    it("parses pane-not-found JSON from stderr-shaped errors", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        stderr: JSON.stringify({ error: { code: "pane_not_found", message: "pane gone" } }),
+        stdout: "",
+      });
+      assert.deepEqual(result, { kind: "missing", error: "pane gone" });
+    });
+
+    it("continues from non-JSON stderr to structured stdout", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        stderr: "warning: connection closed",
+        stdout: JSON.stringify({ error: { code: "pane_not_found", message: "pane gone" } }),
+      });
+      assert.deepEqual(result, { kind: "missing", error: "pane gone" });
+    });
+
+    it("returns unavailable when both error streams are non-JSON", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        message: "command failed",
+        stderr: "warning: connection closed",
+        stdout: "not json either",
+      });
+      assert.deepEqual(result, { kind: "unavailable", error: "command failed" });
+    });
+
+    it("recognizes plain-text pane_not_found on stderr", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        stderr: "pane_not_found: pane w1:p1 not found",
+        stdout: "unrelated output",
+      });
+      assert.deepEqual(result, {
+        kind: "missing",
+        error: "pane_not_found: pane w1:p1 not found",
+      });
+    });
+
+    it("recognizes plain-text not_found on stdout after malformed stderr", () => {
+      const result = __herdrTest__.parsePaneGetError({
+        stderr: "{malformed json",
+        stdout: "not_found: pane w1:p1",
+      });
+      assert.deepEqual(result, { kind: "missing", error: "not_found: pane w1:p1" });
+    });
+
+    it("normalizes unknown agent_status values", () => {
+      const result = __herdrTest__.parsePaneGetOutput(JSON.stringify({
+        result: { pane: { pane_id: "w1:p1", agent: "pi", agent_status: "paused" } },
+      }), "w1:p1");
+      assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
     });
   });
 });

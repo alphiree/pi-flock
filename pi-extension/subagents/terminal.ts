@@ -8,6 +8,7 @@ import {
   isHerdrAvailable,
   readHerdrScreen,
   readHerdrScreenAsync,
+  inspectHerdrPane,
   renameHerdrTab,
   renameHerdrWorkspace,
   sendHerdrCommand,
@@ -98,6 +99,17 @@ export function readPane(paneId: PaneId, lines = 50): string {
 export async function readPaneAsync(paneId: PaneId, lines = 50): Promise<string> {
   assertTerminalAvailable();
   return readHerdrScreenAsync(paneId, lines);
+}
+
+export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
+
+export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.ts").PaneInspection> {
+  assertTerminalAvailable();
+  const result = await inspectHerdrPane(paneId);
+  if (result.kind === "present") {
+    return { kind: "present", observedAt: Date.now(), ...result };
+  }
+  return result;
 }
 
 export function closePane(paneId: PaneId): void {
