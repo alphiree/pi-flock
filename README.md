@@ -168,9 +168,18 @@ cp config.json.example config.json
 {
   "status": {
     "enabled": true
+  },
+  "models": {
+    "default": "anthropic/claude-sonnet-4-6",
+    "agents": {
+      "scout": "openai/gpt-5-mini",
+      "reviewer": "anthropic/claude-sonnet-4-6"
+    }
   }
 }
 ```
+
+`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
 
 `config.json` is gitignored so local overrides don't get committed.
 
@@ -179,7 +188,7 @@ cp config.json.example config.json
 ## Spawning Subagents
 
 ```typescript
-// Named agent with defaults from agent definition
+// Named agent with defaults from agent definition or config.json
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
 // Force a full-context fork for this spawn

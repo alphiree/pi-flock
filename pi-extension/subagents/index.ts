@@ -23,7 +23,6 @@ import {
   interruptPane,
   shellQuote,
   renameCurrentTab,
-  renameCurrentWorkspace,
   readPane,
   readPaneAsync,
   inspectPane,
@@ -37,6 +36,7 @@ import {
   type ResolvedRuntimePlan,
   type ThinkingLevel,
 } from "./runtime-routing.ts";
+import { loadModelConfig } from "./model-config.ts";
 
 import {
   findLastAssistantMessage,
@@ -468,6 +468,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 }
 
 const statusConfig = loadStatusConfig();
+const modelConfig = loadModelConfig();
 
 function resolveResultPresentation(
   result: Pick<
@@ -1112,9 +1113,15 @@ async function launchSubagent(
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
+  const configuredModel = params.agent
+    ? modelConfig.agents[params.agent] ?? modelConfig.default
+    : modelConfig.default;
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
-    { model: agentDefs?.model, thinking: agentDefs?.thinking },
+    {
+      model: agentDefs?.model ?? configuredModel,
+      thinking: agentDefs?.thinking,
+    },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
     wrapPiModelRegistry(ctx.modelRegistry),
   );
@@ -2461,7 +2468,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (isTerminalAvailable()) {
         try {
           const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameCurrentWorkspace(`🎯 ${label}`);
           renameCurrentTab(`🎯 Plan: ${label}`);
         } catch {
           // non-critical -- do not block the plan

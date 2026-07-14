@@ -25,6 +25,7 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import { loadModelConfig, parseModelConfig } from "../pi-extension/subagents/model-config.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -900,6 +901,33 @@ describe("status.ts", () => {
     assert.match(aggregate, /^Subagent status:/);
     assert.match(aggregate, /\+2 more running\./);
     assert.doesNotMatch(aggregate, /\/tmp|\.jsonl/);
+  });
+});
+
+describe("model configuration", () => {
+  it("parses global and per-agent model defaults", () => {
+    assert.deepEqual(
+      parseModelConfig({
+        models: {
+          default: " anthropic/claude-sonnet-4-6 ",
+          agents: { scout: " openai/gpt-5-mini " },
+        },
+      }),
+      {
+        default: "anthropic/claude-sonnet-4-6",
+        agents: { scout: "openai/gpt-5-mini" },
+      },
+    );
+  });
+
+  it("loads no model overrides when config.json is absent", () => {
+    const config = loadModelConfig(join(createTestDir(), "missing-config.json"));
+    assert.deepEqual(config, { agents: {} });
+  });
+
+  it("rejects invalid model configuration", () => {
+    assert.throws(() => parseModelConfig({ models: { default: "" } }), /non-empty string/);
+    assert.throws(() => parseModelConfig({ models: { agents: [] } }), /must be an object/);
   });
 });
 
