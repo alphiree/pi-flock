@@ -297,12 +297,7 @@ Phase 4: Execute          → Scout + sequential workers implement todos
 Phase 5: Review           → Reviewer subagent checks all changes
 ```
 
-Tab/window titles update to show current phase:
-
-```
-🔍 Investigating: dark mode → 💬 Planning: dark mode
-→ 🔨 Executing: 1/3 → 🔎 Reviewing → ✅ Done
-```
+The parent workspace and tab names stay unchanged. Subagents are created in newly named tabs or panes for each phase.
 
 ---
 

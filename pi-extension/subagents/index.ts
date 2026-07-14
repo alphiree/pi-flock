@@ -22,7 +22,6 @@ import {
   closePane,
   interruptPane,
   shellQuote,
-  renameCurrentTab,
   readPane,
   readPaneAsync,
   inspectPane,
@@ -2459,16 +2458,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (!task) {
         ctx.ui.notify("Usage: /plan <what to build>", "warning");
         return;
-      }
-
-      // Rename the tab to show this is a planning session
-      if (isTerminalAvailable()) {
-        try {
-          const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameCurrentTab(`🎯 Plan: ${label}`);
-        } catch {
-          // non-critical -- do not block the plan
-        }
       }
 
       // Load the plan skill from the subagents extension directory
