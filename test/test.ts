@@ -1187,6 +1187,10 @@ describe("subagent discovery", () => {
         "\nPI_CODING_AGENT_DIR=",
         [name, sessionPath, message],
       );
+      const resumeMessagePath = script.match(/'@([^']+)'/)?.[1];
+      assert.ok(resumeMessagePath, "expected the resume message artifact argument");
+      assert.match(basename(resumeMessagePath), /-[0-9a-f-]{36}\.md$/i);
+      assert.equal(readFileSync(resumeMessagePath, "utf8"), message);
 
     } finally {
       for (const handler of shutdownHandlers) {

@@ -1969,7 +1969,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               .replace(/[^a-z0-9\s-]/g, "")
               .replace(/\s+/g, "-")
               .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}-${id}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, "utf8");
