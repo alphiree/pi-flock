@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   existsSync,
   mkdirSync,
 } from "node:fs";
@@ -115,6 +116,12 @@ const ThinkingLevelSchema = Type.Union(
   },
 );
 
+const SubagentMessageDeliverAs = Type.Union([
+  Type.Literal("normal"),
+  Type.Literal("followUp"),
+  Type.Literal("steer"),
+]);
+
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
@@ -157,6 +164,20 @@ const SubagentParams = Type.Object({
       description:
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
     }),
+  ),
+});
+
+const SubagentMessageParams = Type.Object({
+  id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+  subagent_id: Type.Optional(Type.String({ description: "Compatibility alias for id" })),
+  name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+  message: Type.String({ description: "Message to deliver to the subagent as a Pi user message" }),
+  deliverAs: Type.Optional(
+    Type.Union([
+      Type.Literal("normal"),
+      Type.Literal("followUp"),
+      Type.Literal("steer"),
+    ], { description: "Delivery mode. Defaults to followUp for safe queued delivery." }),
   ),
 });
 
@@ -227,6 +248,7 @@ const SPAWNING_TOOLS = new Set([
   "Agent",
   "get_subagent_result",
   "steer_subagent",
+  "subagent_message",
   "ping_subagents",
   "subagent_interrupt",
   "subagents_list",
@@ -563,6 +585,7 @@ interface RunningSubagent {
   sessionFile: string;
   launchScriptFile?: string;
   activityFile?: string;
+  inboxFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
     ok: boolean;
@@ -1045,20 +1068,30 @@ function normalizeAgentCompatParams(params: Static<typeof AgentCompatParams>):
 function createStartedSubagentResult(
   running: RunningSubagent,
   params: Static<typeof SubagentParams>,
-  options: { includeSubagentId?: boolean; alreadyRunning?: boolean } = {},
+  options: {
+    includeSubagentId?: boolean;
+    alreadyRunning?: boolean;
+    messageDelivery?: { status: "queued"; messageId: string; deliverAs: SubagentInboxDeliverAs } | { status: "failed"; error: string };
+  } = {},
 ) {
   const resultName = options.alreadyRunning ? running.name : params.name;
   const resultTask = options.alreadyRunning ? running.task : params.task;
   const resultAgent = options.alreadyRunning ? running.agent : params.agent;
+  const reusedAndQueued = options.alreadyRunning && options.messageDelivery?.status === "queued";
+  const reusedButFailed = options.alreadyRunning && options.messageDelivery?.status === "failed";
 
   return {
     content: [
       {
         type: "text" as const,
         text:
-          (options.alreadyRunning
-            ? `Sub-agent "${running.name}" is already running; reusing the existing Herdr pane instead of launching a duplicate. `
-            : `Sub-agent "${params.name}" launched and is now running in the background. `) +
+          (reusedAndQueued
+            ? `Sub-agent "${running.name}" is already running; queued your follow-up message for the existing Herdr pane instead of launching a duplicate. `
+            : reusedButFailed
+              ? `Sub-agent "${running.name}" is already running, but the follow-up message could not be delivered: ${options.messageDelivery?.error}. `
+              : options.alreadyRunning
+                ? `Sub-agent "${running.name}" is already running; reusing the existing Herdr pane instead of launching a duplicate. `
+                : `Sub-agent "${params.name}" launched and is now running in the background. `) +
           `Do NOT generate or assume any results - you have no idea what the sub-agent will do or produce. ` +
           `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
           `Until then, move on to other work or tell the user you're waiting.`,
@@ -1075,7 +1108,8 @@ function createStartedSubagentResult(
       model: running.runtimePlan?.model,
       thinking: running.runtimePlan?.thinking,
       runtimePlan: running.runtimePlan,
-      status: options.alreadyRunning ? "already_running" : "started",
+      status: reusedAndQueued ? "reused_and_queued" : options.alreadyRunning ? "already_running" : "started",
+      ...(options.messageDelivery ? { messageDelivery: options.messageDelivery } : {}),
     },
   };
 }
@@ -1210,7 +1244,39 @@ function resolveSteerTarget(params: { id?: string; subagent_id?: string; name?: 
   return { error: `No running subagent named "${requestedName}".` };
 }
 
-function handleSteerSubagent(params: { id?: string; subagent_id?: string; name?: string; message?: string }) {
+type SubagentInboxDeliverAs = Static<typeof SubagentMessageDeliverAs>;
+
+interface SubagentInboxMessage {
+  id: string;
+  type: "user_message";
+  createdAt: string;
+  message: string;
+  deliverAs: SubagentInboxDeliverAs;
+}
+
+function getSubagentInboxFile(artifactDir: string, id: string): string {
+  return join(artifactDir, "inbox", `${id}.jsonl`);
+}
+
+function appendSubagentInboxMessage(
+  running: RunningSubagent,
+  message: string,
+  deliverAs: SubagentInboxDeliverAs = "followUp",
+): SubagentInboxMessage {
+  if (!running.inboxFile) throw new Error("subagent has no inbox file; resume it or spawn a new child with the updated pi-flock extension");
+  const payload: SubagentInboxMessage = {
+    id: randomUUID(),
+    type: "user_message",
+    createdAt: new Date().toISOString(),
+    message,
+    deliverAs,
+  };
+  mkdirSync(dirname(running.inboxFile), { recursive: true });
+  appendFileSync(running.inboxFile, `${JSON.stringify(payload)}\n`, "utf8");
+  return payload;
+}
+
+function handleSubagentMessage(params: Static<typeof SubagentMessageParams>) {
   const message = pickString(params.message);
   if (!message) {
     return { content: [{ type: "text" as const, text: "Provide a non-empty message to send." }], details: { error: "missing message" } };
@@ -1221,20 +1287,39 @@ function handleSteerSubagent(params: { id?: string; subagent_id?: string; name?:
     return { content: [{ type: "text" as const, text: resolved.error }], details: { error: resolved.error } };
   }
 
-  const text =
-    "Direct terminal steering is disabled in this build because sending arbitrary text to a pane can execute in a shell if the child process exits between polls. " +
-    "Use subagent_resume with the returned session file for safe follow-up until a Pi IPC transport is implemented.";
-  return {
-    content: [{ type: "text" as const, text }],
-    details: {
-      error: "unsafe terminal steering disabled",
-      id: resolved.running.id,
-      subagent_id: resolved.running.id,
-      name: resolved.running.name,
-      status: "unsupported",
-      sessionFile: resolved.running.sessionFile,
-    },
-  };
+  try {
+    const deliverAs = params.deliverAs ?? "followUp";
+    const payload = appendSubagentInboxMessage(resolved.running, message, deliverAs);
+    return {
+      content: [{ type: "text" as const, text: `Queued message for subagent "${resolved.running.name}".` }],
+      details: {
+        id: resolved.running.id,
+        subagent_id: resolved.running.id,
+        name: resolved.running.name,
+        status: "queued",
+        messageId: payload.id,
+        deliverAs,
+        sessionFile: resolved.running.sessionFile,
+      },
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: "text" as const, text: `Could not deliver message to subagent "${resolved.running.name}": ${errorMessage}` }],
+      details: {
+        error: errorMessage,
+        id: resolved.running.id,
+        subagent_id: resolved.running.id,
+        name: resolved.running.name,
+        status: "delivery_failed",
+        sessionFile: resolved.running.sessionFile,
+      },
+    };
+  }
+}
+
+function handleSteerSubagent(params: { id?: string; subagent_id?: string; name?: string; message?: string }) {
+  return handleSubagentMessage({ ...params, message: params.message ?? "", deliverAs: "steer" });
 }
 
 function handlePingSubagents(params: { includeInteractive?: boolean; message?: string } = {}) {
@@ -1330,7 +1415,16 @@ async function executeSubagentStart(
 
   if (options.reuseExisting) {
     const existing = findReusableRunningSubagent(params);
-    if (existing) return createStartedSubagentResult(existing, params, { ...options, alreadyRunning: true });
+    if (existing) {
+      let messageDelivery: { status: "queued"; messageId: string; deliverAs: SubagentInboxDeliverAs } | { status: "failed"; error: string };
+      try {
+        const payload = appendSubagentInboxMessage(existing, params.task, "followUp");
+        messageDelivery = { status: "queued", messageId: payload.id, deliverAs: payload.deliverAs };
+      } catch (error) {
+        messageDelivery = { status: "failed", error: error instanceof Error ? error.message : String(error) };
+      }
+      return createStartedSubagentResult(existing, params, { ...options, alreadyRunning: true, messageDelivery });
+    }
   }
 
   if (!isTerminalAvailable()) return muxUnavailableResult();
@@ -1582,7 +1676,10 @@ export const __test__ = {
   createStartedSubagentResult,
   handleGetSubagentResult,
   handleSteerSubagent,
+  handleSubagentMessage,
   handlePingSubagents,
+  appendSubagentInboxMessage,
+  getSubagentInboxFile,
   storeCompletedSubagentResult,
   findReusableRunningSubagent,
   hasReuseBlockingOverrides,
@@ -1687,7 +1784,9 @@ async function launchSubagent(
   }
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
+  const inboxFile = getSubagentInboxFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
+  mkdirSync(dirname(inboxFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1755,6 +1854,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
+  envParts.push(`PI_SUBAGENT_INBOX_FILE=${shellQuote(inboxFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
@@ -1808,6 +1908,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    inboxFile,
     interactive: effectiveInteractive,
     runtimePlan,
     lifecycle: createLifecycle(startTime),
@@ -2162,19 +2263,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── subagent_message tool ──
+  if (shouldRegister("subagent_message"))
+    pi.registerTool({
+      name: "subagent_message",
+      label: "Message Subagent",
+      description:
+        "Deliver a structured Pi user message to a running subagent by id or exact name. " +
+        "This uses the child inbox and pi.sendUserMessage, never terminal keystrokes.",
+      parameters: SubagentMessageParams,
+      async execute(_toolCallId, params) {
+        return handleSubagentMessage(params);
+      },
+    });
+
   // ── steer_subagent compatibility tool ──
   if (shouldRegister("steer_subagent"))
     pi.registerTool({
       name: "steer_subagent",
       label: "Steer Subagent",
       description:
-        "Compatibility placeholder for steering a subagent by id or exact name. " +
-        "Direct terminal text steering is disabled as unsafe; use subagent_resume with the session file for follow-up.",
+        "Compatibility steering for a running subagent by id or exact name. " +
+        "Delivery uses the child inbox and pi.sendUserMessage with steer mode, never terminal keystrokes.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         subagent_id: Type.Optional(Type.String({ description: "Compatibility alias for id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
-        message: Type.String({ description: "Message for compatibility; direct delivery is disabled as unsafe" }),
+        message: Type.String({ description: "Message to deliver" }),
       }),
       async execute(_toolCallId, params) {
         return handleSteerSubagent(params);
@@ -2410,7 +2525,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
+        const inboxFile = getSubagentInboxFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+        mkdirSync(dirname(inboxFile), { recursive: true });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2440,6 +2557,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_INBOX_FILE=${shellQuote(inboxFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
@@ -2460,6 +2578,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: params.sessionPath,
           launchScriptFile,
           activityFile,
+          inboxFile,
           interactive,
           runtimePlan: undefined,
           lifecycle: createLifecycle(startTime),

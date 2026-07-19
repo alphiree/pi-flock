@@ -54,6 +54,11 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildCompletionSidecar,
+  deliverInboxMessage,
+  getCompleteInboxChunk,
+  readInboxCursor,
+  parseInboxMessages,
+  writeInboxCursor,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
@@ -110,7 +115,8 @@ function createMockExtensionApi() {
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
   const eventHandlers = new Map<string, Array<Function>>();
-  const sentUserMessages: string[] = [];
+  const sentUserMessages: any[] = [];
+  const sentUserMessageCalls: Array<{ message: any; options?: any }> = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
@@ -119,6 +125,7 @@ function createMockExtensionApi() {
     eventHandlers,
     sentUserMessages,
     sentMessages,
+    sentUserMessageCalls,
     api: {
       on(event: string, handler: Function) {
         const handlers = eventHandlers.get(event) ?? [];
@@ -135,8 +142,9 @@ function createMockExtensionApi() {
         registeredMessageRenderers.push({ name, renderer });
       },
       registerShortcut() {},
-      sendUserMessage(message: string) {
+      sendUserMessage(message: any, options?: any) {
         sentUserMessages.push(message);
+        sentUserMessageCalls.push({ message, options });
       },
       sendMessage(message: any, options?: any) {
         sentMessages.push({ message, options });
@@ -1207,6 +1215,14 @@ describe("subagent discovery", () => {
       assert.equal(readFileSync(resumeMessagePath, "utf8"), message);
       assert.match(script, /PI_DENY_TOOLS=.*Agent/);
       assert.match(script, /PI_DENY_TOOLS=.*subagent/);
+      assert.match(script, /PI_SUBAGENT_INBOX_FILE=/);
+      const resumedRunning = Array.from(runningMap.values()).find((entry: any) => entry.sessionFile === sessionPath);
+      assert.ok(resumedRunning?.inboxFile, "resumed children must keep an inbox file");
+      const queued = testApi.handleSubagentMessage({ id: resumedRunning.id, message: "resume follow-up" });
+      assert.equal(queued.details.status, "queued");
+      assert.deepEqual(parseInboxMessages(readFileSync(resumedRunning.inboxFile, "utf8")), [
+        { message: "resume follow-up", deliverAs: "followUp" },
+      ]);
       const secondScript = readFileSync(secondResult.details.launchScriptFile, "utf8");
       const secondResumeMessagePath = secondScript.match(/'@([^']+)'/)?.[1];
       assert.ok(secondResumeMessagePath, "expected the second resume message artifact argument");
@@ -1938,6 +1954,63 @@ describe("subagent-done.ts", () => {
     });
   });
 
+  describe("inbox delivery", () => {
+    it("parses JSONL inbox messages and delivers with Pi user-message modes", () => {
+      const messages = parseInboxMessages([
+        JSON.stringify({ type: "user_message", message: "normal", deliverAs: "normal" }),
+        JSON.stringify({ type: "ignored", message: "skip", deliverAs: "steer" }),
+        JSON.stringify({ type: "user_message", message: "queued", deliverAs: "followUp" }),
+        JSON.stringify({ type: "user_message", message: "interrupt", deliverAs: "steer" }),
+      ].join("\n"));
+      assert.deepEqual(messages, [
+        { message: "normal", deliverAs: "normal" },
+        { message: "queued", deliverAs: "followUp" },
+        { message: "interrupt", deliverAs: "steer" },
+      ]);
+
+      const delivered: Array<{ message: string; options?: any }> = [];
+      const pi = { sendUserMessage: (message: string, options?: any) => delivered.push({ message, options }) } as any;
+      deliverInboxMessage(pi, "normal", "normal");
+      deliverInboxMessage(pi, "queued", "followUp");
+      deliverInboxMessage(pi, "interrupt", "steer");
+      assert.deepEqual(delivered, [
+        { message: "normal", options: { deliverAs: "followUp" } },
+        { message: "queued", options: { deliverAs: "followUp" } },
+        { message: "interrupt", options: { deliverAs: "steer" } },
+      ]);
+    });
+
+    it("does not consume a split JSONL inbox record before its newline arrives", () => {
+      const first = JSON.stringify({ type: "user_message", message: "first", deliverAs: "followUp" }) + "\n";
+      const second = JSON.stringify({ type: "user_message", message: "second", deliverAs: "followUp" });
+      const partial = getCompleteInboxChunk(first + second.slice(0, 20), 0);
+      assert.equal(partial.chunk, first);
+      assert.equal(partial.nextOffset, first.length);
+
+      const complete = getCompleteInboxChunk(first + second + "\n", partial.nextOffset);
+      assert.equal(complete.chunk, second + "\n");
+      assert.deepEqual(parseInboxMessages(complete.chunk), [{ message: "second", deliverAs: "followUp" }]);
+    });
+
+    it("persists the inbox cursor so child reloads skip consumed records", () => {
+      const dir = createTestDir();
+      const inboxFile = join(dir, "child.jsonl");
+      try {
+        const first = JSON.stringify({ type: "user_message", message: "first", deliverAs: "followUp" }) + "\n";
+        const second = JSON.stringify({ type: "user_message", message: "second", deliverAs: "followUp" }) + "\n";
+        writeFileSync(inboxFile, first + second, "utf8");
+        writeInboxCursor(inboxFile, first.length);
+
+        const offsetAfterReload = readInboxCursor(inboxFile);
+        const chunk = getCompleteInboxChunk(readFileSync(inboxFile, "utf8"), offsetAfterReload);
+        assert.equal(chunk.chunk, second);
+        assert.deepEqual(parseInboxMessages(chunk.chunk), [{ message: "second", deliverAs: "followUp" }]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("buildCompletionSidecar", () => {
     it("emits done immediately for a normal auto-exit completion", () => {
       assert.deepEqual(buildCompletionSidecar([
@@ -2458,6 +2531,7 @@ describe("tool registration", () => {
       "Agent",
       "get_subagent_result",
       "steer_subagent",
+      "subagent_message",
       "ping_subagents",
       "subagent_interrupt",
       "subagent_resume",
@@ -2474,6 +2548,7 @@ describe("tool registration", () => {
     assert.ok(registeredTools.find((tool) => tool.name === "Agent"), "expected Agent tool");
     assert.ok(registeredTools.find((tool) => tool.name === "get_subagent_result"), "expected result tool");
     assert.ok(registeredTools.find((tool) => tool.name === "steer_subagent"), "expected steer tool");
+    assert.ok(registeredTools.find((tool) => tool.name === "subagent_message"), "expected message tool");
     assert.ok(registeredTools.find((tool) => tool.name === "ping_subagents"), "expected ping tool");
 
     const normalized = testApi.normalizeAgentCompatParams({
@@ -2562,10 +2637,11 @@ describe("tool registration", () => {
     completedMap.clear();
   });
 
-  it("rejects direct steering without sending terminal text", () => {
+  it("delivers subagent messages through the child inbox without terminal text", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     const completedMap = testApi.completedResults as Map<string, any>;
+    const dir = createTestDir();
     runningMap.clear();
     completedMap.clear();
     const running = {
@@ -2574,31 +2650,42 @@ describe("tool registration", () => {
       task: "work",
       surface: "pane-steer",
       sessionFile: "/tmp/steer.jsonl",
+      inboxFile: join(dir, "inbox", "steer-compat.jsonl"),
       lifecycle: createLifecycle(1_000),
     };
     runningMap.set(running.id, running);
 
-    const result = testApi.handleSteerSubagent({ subagent_id: running.id, message: "hello child" });
-    assert.equal(result.details.status, "unsupported");
-    assert.match(result.details.error, /unsafe terminal steering disabled/);
-    assert.match(result.content[0].text, /subagent_resume/);
+    try {
+      const result = testApi.handleSteerSubagent({ subagent_id: running.id, message: "hello child" });
+      assert.equal(result.details.status, "queued");
+      assert.equal(result.details.deliverAs, "steer");
+      const inbox = readFileSync(running.inboxFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(inbox.length, 1);
+      assert.equal(inbox[0].message, "hello child");
+      assert.equal(inbox[0].deliverAs, "steer");
 
-    runningMap.delete(running.id);
-    testApi.storeCompletedSubagentResult(running, {
-      name: running.name,
-      task: running.task,
-      summary: "done",
-      exitCode: 0,
-      elapsed: 1,
-      sessionFile: running.sessionFile,
-    });
-    const completed = testApi.handleSteerSubagent({ id: running.id, message: "too late" });
-    assert.match(completed.details.error, /already completed/);
-    const missing = testApi.handleSteerSubagent({ id: "missing", message: "hello" });
-    assert.match(missing.details.error, /No running subagent/);
+      const followUp = testApi.handleSubagentMessage({ id: running.id, message: "queued context" });
+      assert.equal(followUp.details.status, "queued");
+      assert.equal(followUp.details.deliverAs, "followUp");
 
-    runningMap.clear();
-    completedMap.clear();
+      runningMap.delete(running.id);
+      testApi.storeCompletedSubagentResult(running, {
+        name: running.name,
+        task: running.task,
+        summary: "done",
+        exitCode: 0,
+        elapsed: 1,
+        sessionFile: running.sessionFile,
+      });
+      const completed = testApi.handleSteerSubagent({ id: running.id, message: "too late" });
+      assert.match(completed.details.error, /already completed/);
+      const missing = testApi.handleSteerSubagent({ id: "missing", message: "hello" });
+      assert.match(missing.details.error, /No running subagent/);
+    } finally {
+      runningMap.clear();
+      completedMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("observes non-interactive subagents by default and can include interactive ones", () => {
@@ -2713,6 +2800,29 @@ describe("tool registration", () => {
     runningMap.clear();
   });
 
+  it("writes Agent reuse follow-up prompts to the existing child's inbox", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const dir = createTestDir();
+    const running = {
+      id: "planner-existing",
+      name: "Planner",
+      agent: "planner",
+      task: "original plan",
+      sessionFile: "/tmp/planner.jsonl",
+      inboxFile: join(dir, "inbox", "planner-existing.jsonl"),
+    };
+
+    try {
+      const payload = testApi.appendSubagentInboxMessage(running, "additional context", "followUp");
+      assert.equal(payload.message, "additional context");
+      assert.equal(payload.deliverAs, "followUp");
+      const inbox = parseInboxMessages(readFileSync(running.inboxFile, "utf8"));
+      assert.deepEqual(inbox, [{ message: "additional context", deliverAs: "followUp" }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("reports reused Agent metadata from the existing running subagent", () => {
     const testApi = (subagentsModule as any).__test__;
     const running = {
@@ -2726,12 +2836,13 @@ describe("tool registration", () => {
     const result = testApi.createStartedSubagentResult(
       running,
       { name: "Other Planner", agent: "planner", task: "new plan" },
-      { includeSubagentId: true, alreadyRunning: true },
+      { includeSubagentId: true, alreadyRunning: true, messageDelivery: { status: "queued", messageId: "msg-1", deliverAs: "followUp" } },
     );
-    assert.equal(result.details.status, "already_running");
+    assert.equal(result.details.status, "reused_and_queued");
     assert.equal(result.details.name, "Planner");
     assert.equal(result.details.task, "original plan");
     assert.equal(result.details.agent, "planner");
+    assert.deepEqual(result.details.messageDelivery, { status: "queued", messageId: "msg-1", deliverAs: "followUp" });
   });
 
   it("registers subagent_resume with an autoExit override", () => {

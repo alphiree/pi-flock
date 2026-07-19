@@ -6,7 +6,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -75,6 +75,79 @@ export function buildCompletionSidecar(messages: any[] | undefined):
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
 }
 
+type InboxDeliverAs = "normal" | "followUp" | "steer";
+
+interface InboxMessage {
+  id?: string;
+  type?: string;
+  message?: unknown;
+  deliverAs?: unknown;
+}
+
+export function getInboxCursorFile(inboxFile: string): string {
+  return `${inboxFile}.cursor`;
+}
+
+export function readInboxCursor(inboxFile: string): number {
+  try {
+    const value = Number(readFileSync(getInboxCursorFile(inboxFile), "utf8"));
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function writeInboxCursor(inboxFile: string, offset: number) {
+  writeFileSync(getInboxCursorFile(inboxFile), String(Math.max(0, offset)), "utf8");
+}
+
+export function getCompleteInboxChunk(content: string, offset: number): { chunk: string; nextOffset: number } {
+  const safeOffset = content.length < offset ? 0 : offset;
+  const unread = content.slice(safeOffset);
+  const lastNewline = unread.lastIndexOf("\n");
+  if (lastNewline < 0) return { chunk: "", nextOffset: safeOffset };
+  return {
+    chunk: unread.slice(0, lastNewline + 1),
+    nextOffset: safeOffset + lastNewline + 1,
+  };
+}
+
+export function parseInboxMessages(content: string): Array<{ message: string; deliverAs: InboxDeliverAs }> {
+  const messages: Array<{ message: string; deliverAs: InboxDeliverAs }> = [];
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: InboxMessage;
+    try {
+      parsed = JSON.parse(trimmed) as InboxMessage;
+    } catch {
+      continue;
+    }
+    if (parsed.type !== "user_message") continue;
+    if (typeof parsed.message !== "string" || !parsed.message.trim()) continue;
+    const deliverAs = parsed.deliverAs === "normal" || parsed.deliverAs === "steer" || parsed.deliverAs === "followUp"
+      ? parsed.deliverAs
+      : "followUp";
+    messages.push({ message: parsed.message, deliverAs });
+  }
+  return messages;
+}
+
+export function deliverInboxMessage(
+  pi: Pick<ExtensionAPI, "sendUserMessage">,
+  message: string,
+  deliverAs: InboxDeliverAs,
+) {
+  if (deliverAs === "steer") {
+    pi.sendUserMessage(message, { deliverAs: "steer" });
+    return;
+  }
+
+  // Use followUp for both explicit followUp and compatibility "normal" delivery.
+  // It runs immediately when the child is idle and queues safely when it is busy.
+  pi.sendUserMessage(message, { deliverAs: "followUp" });
+}
+
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
     .split(",")
@@ -96,6 +169,35 @@ export default function (pi: ExtensionAPI) {
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
+  const inboxFile = process.env.PI_SUBAGENT_INBOX_FILE;
+  const inboxPollMs = Math.max(100, Number(process.env.PI_SUBAGENT_INBOX_POLL_MS ?? 500) || 500);
+  let inboxOffset = inboxFile ? readInboxCursor(inboxFile) : 0;
+  let inboxInterval: ReturnType<typeof setInterval> | null = null;
+
+  function pollInbox() {
+    if (!inboxFile || !existsSync(inboxFile)) return;
+    const content = readFileSync(inboxFile, "utf8");
+    const { chunk, nextOffset } = getCompleteInboxChunk(content, inboxOffset);
+    if (!chunk.trim()) return;
+    const messages = parseInboxMessages(chunk);
+    for (const inboxMessage of messages) {
+      deliverInboxMessage(pi, inboxMessage.message, inboxMessage.deliverAs);
+    }
+    inboxOffset = nextOffset;
+    writeInboxCursor(inboxFile, inboxOffset);
+  }
+
+  function startInboxPolling() {
+    if (!inboxFile || inboxInterval) return;
+    pollInbox();
+    inboxInterval = setInterval(pollInbox, inboxPollMs);
+  }
+
+  function stopInboxPolling() {
+    if (!inboxInterval) return;
+    clearInterval(inboxInterval);
+    inboxInterval = null;
+  }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -159,6 +261,7 @@ export default function (pi: ExtensionAPI) {
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
+    startInboxPolling();
   });
 
   pi.on("input", () => {
@@ -255,6 +358,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    stopInboxPolling();
     recorder.sessionShutdown((event as any).reason);
   });
 
