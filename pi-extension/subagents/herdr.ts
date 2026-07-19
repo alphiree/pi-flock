@@ -243,6 +243,12 @@ export async function inspectHerdrPane(surface: string): Promise<PaneInspectionR
   }
 }
 
+export function focusHerdrAgent(surface: string): void {
+  // Resolve only a tracked Herdr agent/pane identity. Unlike pane run/send,
+  // this changes focus and never writes text into the terminal.
+  herdrExec(["agent", "focus", surface]);
+}
+
 export function sendHerdrCommand(surface: string, command: string): void {
   // pane run sends the text and Enter in a single socket request, avoiding
   // a race where Enter could arrive before the text is fully processed.

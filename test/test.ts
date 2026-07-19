@@ -49,7 +49,9 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
+  MAX_RELAY_TEXT_LENGTH,
+  getLatestAssistantTextTurn,
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
@@ -61,6 +63,7 @@ import {
   writeInboxCursor,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import { readFlockEvents } from "../pi-extension/subagents/flock-events.ts";
 import {
   createLifecycle,
   lifecycleTransition,
@@ -1878,6 +1881,94 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  describe("root event relay", () => {
+    it("extracts only bounded assistant text blocks", () => {
+      assert.equal(getLatestAssistantTextTurn({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "private reasoning" },
+          { type: "text", text: "  visible answer  " },
+          { type: "toolCall", name: "bash" },
+        ],
+      }), "visible answer");
+      assert.equal(getLatestAssistantTextTurn({ role: "toolResult", content: [{ type: "text", text: "tool output" }] }), null);
+      assert.equal(getLatestAssistantTextTurn({ role: "user", content: [{ type: "text", text: "initial task" }] }), null);
+      assert.equal(getLatestAssistantTextTurn({ role: "assistant", content: [{ type: "thinking", thinking: "only thought" }] }), null);
+
+      const bounded = getLatestAssistantTextTurn({
+        role: "assistant",
+        content: [{ type: "text", text: "x".repeat(MAX_RELAY_TEXT_LENGTH + 1) }],
+      });
+      assert.ok(bounded);
+      assert.equal(bounded!.length, MAX_RELAY_TEXT_LENGTH);
+      assert.match(bounded!, /\.\.\.$/);
+    });
+
+    it("publishes registration, one settled text turn, and final closure", () => {
+      withTempDir((eventDir) => {
+        const envNames = [
+          "PI_FLOCK_EVENT_DIR",
+          "PI_FLOCK_ROOT_ID",
+          "PI_FLOCK_PARENT_ID",
+          "PI_FLOCK_RELAY_TURNS",
+          "PI_SUBAGENT_ID",
+          "PI_SUBAGENT_SESSION_ID",
+          "PI_SUBAGENT_SURFACE",
+          "PI_SUBAGENT_NAME",
+          "PI_SUBAGENT_AGENT",
+          "PI_SUBAGENT_INTERACTIVE",
+        ] as const;
+        const previous = new Map(envNames.map((name) => [name, process.env[name]]));
+        process.env.PI_FLOCK_EVENT_DIR = eventDir;
+        process.env.PI_FLOCK_ROOT_ID = "root-1";
+        process.env.PI_FLOCK_PARENT_ID = "parent-1";
+        process.env.PI_FLOCK_RELAY_TURNS = "1";
+        process.env.PI_SUBAGENT_ID = "child-1";
+        process.env.PI_SUBAGENT_SESSION_ID = "session-1";
+        process.env.PI_SUBAGENT_SURFACE = "pane-1";
+        process.env.PI_SUBAGENT_NAME = "Planner";
+        process.env.PI_SUBAGENT_AGENT = "planner";
+        process.env.PI_SUBAGENT_INTERACTIVE = "1";
+
+        try {
+          const { api, eventHandlers } = createMockExtensionApi();
+          subagentDoneExtension(api);
+          const emit = (name: string, event: any, ctx: any = {}) => {
+            for (const handler of eventHandlers.get(name) ?? []) handler(event, ctx);
+          };
+
+          emit("session_start", {}, { ui: { setWidget() {} } });
+          emit("turn_end", {
+            turnIndex: 1,
+            message: {
+              role: "assistant",
+              content: [
+                { type: "thinking", thinking: "do not relay" },
+                { type: "text", text: "completed result" },
+              ],
+            },
+            toolResults: [{ role: "toolResult", content: [{ type: "text", text: "do not relay" }] }],
+          });
+          emit("agent_settled", {});
+          emit("agent_settled", {});
+          emit("session_shutdown", { reason: "reload" });
+          emit("session_shutdown", { reason: "quit" });
+          emit("session_shutdown", { reason: "quit" });
+
+          const events = readFlockEvents(eventDir).flatMap((result) => result.ok ? [result.event] : []);
+          assert.deepEqual(events.map((event) => event.type).sort(), ["closed", "registered", "turn"]);
+          const turn = events.find((event) => event.type === "turn");
+          assert.equal(turn?.type, "turn");
+          assert.equal(turn?.text, "completed result");
+          assert.equal(turn?.runId, "child-1");
+          assert.equal(turn?.parentId, "parent-1");
+        } finally {
+          for (const name of envNames) restoreEnvVar(name, previous.get(name));
+        }
+      });
+    });
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -2744,6 +2835,44 @@ describe("tool registration", () => {
     const output = rendered.render(80).join("\n");
 
     assert.match(output, /\(unnamed\)/);
+  });
+
+  it("orders flock events causally and keeps polling when only flock routes are active", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const base = {
+      version: 1 as const,
+      rootId: "root",
+      runId: "child",
+      parentId: null,
+      sessionId: "session",
+      agentId: "planner",
+      agentName: "Planner",
+      interactive: true,
+      surface: "pane",
+    };
+    const ordered = testApi.orderFlockEvents([
+      { ...base, eventId: "turn", createdAt: 2, type: "turn", turnId: "turn-1", phase: "completed" },
+      { ...base, eventId: "closed", createdAt: 3, type: "closed", reason: "completed" },
+      { ...base, eventId: "registered", createdAt: 1, type: "registered" },
+    ]);
+    assert.deepEqual(ordered.map((event: any) => event.type), ["registered", "turn", "closed"]);
+    assert.equal(testApi.shouldRunStatusRefresh(false, 1, false), true);
+    assert.equal(testApi.shouldRunStatusRefresh(false, 0, false), false);
+    assert.equal(testApi.shouldRestoreFlockPresentation(0, false, 1), true);
+    assert.equal(testApi.shouldRestoreFlockPresentation(0, true, 1), false);
+    const flockNodes = testApi.flockNodes as Map<string, any>;
+    flockNodes.set("crashed", { id: "crashed", state: "active" });
+    testApi.markFlockNodeClosed("crashed", 123);
+    assert.deepEqual(flockNodes.get("crashed"), { id: "crashed", state: "closed", closedAt: 123 });
+    flockNodes.set("worker", { id: "worker", parentId: "crashed", state: "active" });
+    testApi.pruneClosedFlockNodes(20_000);
+    assert.equal(flockNodes.has("crashed"), true, "closed ancestors remain while descendants are active");
+    flockNodes.get("worker").state = "closed";
+    flockNodes.get("worker").closedAt = 123;
+    testApi.pruneClosedFlockNodes(20_000);
+    assert.equal(flockNodes.has("crashed"), false);
+    assert.equal(flockNodes.has("worker"), false);
+    flockNodes.clear();
   });
 
   it("formats child pane labels with a parent session prefix without changing agent name", () => {

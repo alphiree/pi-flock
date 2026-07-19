@@ -22,6 +22,8 @@ const identity: FlockEventIdentity = {
   sessionId: "session-1",
   agentId: "agent-1",
   agentName: "Worker One",
+  interactive: false,
+  surface: "pane-1",
 };
 
 function withEventDir(run: (eventDir: string) => void) {

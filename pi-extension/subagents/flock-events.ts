@@ -41,6 +41,10 @@ export interface FlockEventIdentity {
   agentId: string;
   /** Human-readable agent identity. */
   agentName: string;
+  /** Whether this child is a user-facing coordinator rather than autonomous work. */
+  interactive: boolean;
+  /** Herdr target used exclusively for safe focus navigation. */
+  surface: string;
 }
 
 export interface FlockEventBase extends FlockEventIdentity {
@@ -139,8 +143,10 @@ export function validateFlockEvent(value: unknown):
     return invalidEvent("parentId must be null or a filesystem-safe ID");
   }
   if (!isSafeId(value.sessionId)) return invalidEvent("sessionId must be a filesystem-safe ID");
-  if (!isSafeId(value.agentId)) return invalidEvent("agentId must be a filesystem-safe ID");
+  if (!isName(value.agentId)) return invalidEvent("agentId must be a bounded printable string");
   if (!isName(value.agentName)) return invalidEvent("agentName must be a bounded printable string");
+  if (typeof value.interactive !== "boolean") return invalidEvent("interactive must be boolean");
+  if (!isName(value.surface)) return invalidEvent("surface must be a bounded printable string");
   if (!Number.isSafeInteger(value.createdAt) || value.createdAt < 0) {
     return invalidEvent("createdAt must be a non-negative safe integer");
   }
@@ -155,6 +161,8 @@ export function validateFlockEvent(value: unknown):
     sessionId: value.sessionId,
     agentId: value.agentId,
     agentName: value.agentName,
+    interactive: value.interactive,
+    surface: value.surface,
   };
 
   if (value.type === "registered") {

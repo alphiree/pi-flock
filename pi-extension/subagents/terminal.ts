@@ -9,6 +9,7 @@ import {
   readHerdrScreen,
   readHerdrScreenAsync,
   inspectHerdrPane,
+  focusHerdrAgent,
   renameHerdrTab,
   renameHerdrWorkspace,
   sendHerdrCommand,
@@ -25,6 +26,7 @@ type TerminalTestHooks = {
   createSubagentPane?: (name: string) => PaneId;
   runInPane?: (paneId: PaneId, command: string) => void;
   closePane?: (paneId: PaneId) => void;
+  focusPane?: (paneId: PaneId) => void;
 };
 
 let testHooks: TerminalTestHooks | undefined;
@@ -83,6 +85,12 @@ export const __test__ = {
     };
   },
 };
+
+export function focusPane(paneId: PaneId): void {
+  if (testHooks?.focusPane) return testHooks.focusPane(paneId);
+  assertTerminalAvailable();
+  focusHerdrAgent(paneId);
+}
 
 export function interruptPane(paneId: PaneId): void {
   assertTerminalAvailable();

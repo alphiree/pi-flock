@@ -8,6 +8,38 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  createFlockClosedEvent,
+  createFlockRegisteredEvent,
+  createFlockTurnEvent,
+  publishFlockEvent,
+  type FlockEventIdentity,
+} from "./flock-events.ts";
+
+export const MAX_RELAY_TEXT_LENGTH = 4_000;
+
+export function getLatestAssistantTextTurn(message: unknown): string | null {
+  if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "assistant") {
+    return null;
+  }
+
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return null;
+  const text = content
+    .filter((block): block is { type: "text"; text: string } =>
+      !!block &&
+      typeof block === "object" &&
+      (block as { type?: unknown }).type === "text" &&
+      typeof (block as { text?: unknown }).text === "string",
+    )
+    .map((block) => block.text)
+    .join("")
+    .trim();
+  if (!text) return null;
+  return text.length <= MAX_RELAY_TEXT_LENGTH
+    ? text
+    : `${text.slice(0, MAX_RELAY_TEXT_LENGTH - 3)}...`;
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -173,6 +205,40 @@ export default function (pi: ExtensionAPI) {
   const inboxPollMs = Math.max(100, Number(process.env.PI_SUBAGENT_INBOX_POLL_MS ?? 500) || 500);
   let inboxOffset = inboxFile ? readInboxCursor(inboxFile) : 0;
   let inboxInterval: ReturnType<typeof setInterval> | null = null;
+  const flockEventDir = process.env.PI_FLOCK_EVENT_DIR?.trim();
+  const relayTurns = process.env.PI_FLOCK_RELAY_TURNS === "1";
+  let registeredPublished = false;
+  let closedPublished = false;
+  let latestAssistantTextTurn: string | null = null;
+  let lastRelayedAssistantTextTurn: string | null = null;
+
+  function getFlockIdentity(): FlockEventIdentity | null {
+    const rootId = process.env.PI_FLOCK_ROOT_ID?.trim();
+    const runId = process.env.PI_SUBAGENT_ID?.trim();
+    const sessionId = process.env.PI_SUBAGENT_SESSION_ID?.trim();
+    const surface = process.env.PI_SUBAGENT_SURFACE?.trim();
+    if (!rootId || !runId || !sessionId || !surface) return null;
+    const parentId = process.env.PI_FLOCK_PARENT_ID?.trim() || null;
+    return {
+      rootId,
+      runId,
+      parentId,
+      sessionId,
+      agentId: process.env.PI_SUBAGENT_AGENT?.trim() || "subagent",
+      agentName: process.env.PI_SUBAGENT_NAME?.trim() || "subagent",
+      interactive: process.env.PI_SUBAGENT_INTERACTIVE === "1",
+      surface,
+    };
+  }
+
+  function publishChildFlockEvent(event: ReturnType<typeof createFlockRegisteredEvent> | ReturnType<typeof createFlockTurnEvent> | ReturnType<typeof createFlockClosedEvent>) {
+    if (!flockEventDir) return;
+    try {
+      publishFlockEvent(flockEventDir, event);
+    } catch {
+      // Cross-process observation must never disrupt child work.
+    }
+  }
 
   function pollInbox() {
     if (!inboxFile || !existsSync(inboxFile)) return;
@@ -256,6 +322,11 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    const identity = getFlockIdentity();
+    if (identity && !registeredPublished) {
+      publishChildFlockEvent(createFlockRegisteredEvent(identity));
+      registeredPublished = true;
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -323,6 +394,23 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", (event) => {
     recorder.turnEnd((event as any).turnIndex);
+    // turn_end exposes only the assistant message. This deliberately excludes
+    // the initial user task, thoughts, and tool results from root relaying.
+    latestAssistantTextTurn = getLatestAssistantTextTurn((event as any).message);
+  });
+
+  pi.on("agent_settled", () => {
+    if (!relayTurns || !latestAssistantTextTurn || latestAssistantTextTurn === lastRelayedAssistantTextTurn) {
+      return;
+    }
+    const identity = getFlockIdentity();
+    if (!identity) return;
+    publishChildFlockEvent(createFlockTurnEvent(identity, {
+      turnId: `settled-${Date.now()}`,
+      phase: "completed",
+      text: latestAssistantTextTurn,
+    }));
+    lastRelayedAssistantTextTurn = latestAssistantTextTurn;
   });
 
   pi.on("before_provider_request", () => {
@@ -360,6 +448,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", (event) => {
     stopInboxPolling();
     recorder.sessionShutdown((event as any).reason);
+    // Replacement and reload shutdowns are not final child closure.
+    const identity = getFlockIdentity();
+    if ((event as any).reason === "quit" && identity && !closedPublished) {
+      publishChildFlockEvent(createFlockClosedEvent(identity, { reason: "completed" }));
+      closedPublished = true;
+    }
   });
 
   // Toggle expand/collapse with Ctrl+J

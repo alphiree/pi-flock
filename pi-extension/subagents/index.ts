@@ -21,6 +21,7 @@ import {
   runScriptInPane,
   closePane,
   interruptPane,
+  focusPane,
   shellQuote,
   readPaneAsync,
   inspectPane,
@@ -35,6 +36,7 @@ import {
   type ThinkingLevel,
 } from "./runtime-routing.ts";
 import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
+import { readFlockEvents, type FlockEvent } from "./flock-events.ts";
 
 import {
   findLastAssistantMessage,
@@ -623,8 +625,30 @@ interface CompletedSubagentResult {
   runtimePlan: ResolvedRuntimePlan | undefined;
 }
 
+interface FlockNode {
+  id: string;
+  rootId: string;
+  parentId: string | null;
+  name: string;
+  agent?: string;
+  surface: string;
+  interactive: boolean;
+  startTime: number;
+  direct: boolean;
+  state: "starting" | "active" | "waiting" | "closed";
+  closedAt?: number;
+}
+
+interface FlockRoute {
+  rootId: string;
+  eventDir: string;
+  seenEventIds: Set<string>;
+}
+
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
+  flockNodes: Map<string, FlockNode>;
+  flockRoutes: Map<string, FlockRoute>;
   completedResults: Map<string, CompletedSubagentResult>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
@@ -634,6 +658,8 @@ interface SubagentRuntime {
 function createSubagentRuntime(): SubagentRuntime {
   return {
     runningSubagents: new Map<string, RunningSubagent>(),
+    flockNodes: new Map<string, FlockNode>(),
+    flockRoutes: new Map<string, FlockRoute>(),
     completedResults: new Map<string, CompletedSubagentResult>(),
   };
 }
@@ -644,6 +670,8 @@ const runtime: SubagentRuntime =
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
 const completedResults = runtime.completedResults ?? (runtime.completedResults = new Map<string, CompletedSubagentResult>());
+const flockNodes = runtime.flockNodes ?? (runtime.flockNodes = new Map<string, FlockNode>());
+const flockRoutes = runtime.flockRoutes ?? (runtime.flockRoutes = new Map<string, FlockRoute>());
 const MAX_COMPLETED_RESULTS = 50;
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
@@ -781,6 +809,40 @@ function formatLifecycleWidgetLabel(
   return " starting… ";
 }
 
+function renderFlockWidgetLines(nodes: FlockNode[], width: number): string[] {
+  const now = Date.now();
+  const children = new Map<string | null, FlockNode[]>();
+  for (const node of nodes) {
+    const list = children.get(node.parentId) ?? [];
+    list.push(node);
+    children.set(node.parentId, list);
+  }
+  for (const list of children.values()) list.sort((left, right) => left.startTime - right.startTime);
+  const rows: Array<{ node: FlockNode; depth: number }> = [];
+  const visit = (parentId: string | null, depth: number) => {
+    for (const node of children.get(parentId) ?? []) {
+      rows.push({ node, depth });
+      visit(node.id, depth + 1);
+    }
+  };
+  visit(null, 0);
+  const activeCount = rows.filter(({ node }) => node.state === "starting" || node.state === "active").length;
+  const openCount = rows.length - rows.filter(({ node }) => node.state === "closed").length - activeCount;
+  const info = activeCount > 0 ? openCount > 0 ? `${activeCount} active · ${openCount} open` : `${activeCount} active` : `${openCount} open`;
+  const accent = activeCount > 0 ? ACTIVE_ACCENT : OPEN_ACCENT;
+  const lines = [borderTop("Subagents", info, width, accent)];
+  for (const { node, depth } of rows) {
+    const elapsed = formatElapsedMMSS(node.startTime, node.closedAt ?? now);
+    const prefix = depth === 0 ? " " : `${"  ".repeat(Math.max(0, depth - 1))} └─ `;
+    const agentTag = node.agent ? ` (${node.agent})` : "";
+    const left = `${prefix}${elapsed}  ${node.name}${agentTag} `;
+    const right = ` ${node.state}${node.state === "closed" ? "" : "…"} `;
+    lines.push(borderLine(left, right, width, accent));
+  }
+  lines.push(borderBottom(width, accent));
+  return lines;
+}
+
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const now = Date.now();
   const rendered = agents.map((agent) => ({ agent, projection: projectLifecycle(ensureLifecycle(agent), now) }));
@@ -820,7 +882,8 @@ function updateWidget() {
   const latestCtx = runtime.latestCtx;
   if (!latestCtx?.hasUI) return;
 
-  if (runningSubagents.size === 0) {
+  const rootFlock = !process.env.PI_SUBAGENT_ID;
+  if (runningSubagents.size === 0 && (!rootFlock || flockNodes.size === 0)) {
     latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -836,12 +899,116 @@ function updateWidget() {
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+          return rootFlock && flockNodes.size > 0
+            ? renderFlockWidgetLines(Array.from(flockNodes.values()), width)
+            : renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
         },
       };
     },
     { placement: "aboveEditor" },
   );
+}
+
+function applyFlockEvent(event: FlockEvent, pi: ExtensionAPI) {
+  const existing = flockNodes.get(event.runId);
+  if (event.type === "registered") {
+    flockNodes.set(event.runId, {
+      id: event.runId,
+      rootId: event.rootId,
+      parentId: event.parentId,
+      name: event.agentName,
+      agent: event.agentId === "subagent" ? undefined : event.agentId,
+      surface: event.surface,
+      interactive: event.interactive,
+      startTime: existing?.startTime ?? event.createdAt,
+      direct: existing?.direct ?? event.parentId === null,
+      state: existing?.state ?? "starting",
+      ...(existing?.closedAt != null ? { closedAt: existing.closedAt } : {}),
+    });
+    return;
+  }
+
+  const node = existing;
+  if (!node) return;
+  if (event.type === "closed") {
+    node.state = "closed";
+    node.closedAt = event.createdAt;
+    return;
+  }
+
+  node.state = event.phase === "started" ? "active" : event.phase === "interrupted" ? "waiting" : "waiting";
+  if (
+    event.phase === "completed" &&
+    event.text &&
+    node.parentId === null &&
+    node.interactive
+  ) {
+    pi.sendMessage(
+      {
+        customType: "subagent_turn",
+        content: `${node.name} update:\n\n${event.text}`,
+        display: true,
+        details: { id: node.id, name: node.name, agent: node.agent, surface: node.surface, text: event.text },
+      },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+  }
+}
+
+function orderFlockEvents(events: FlockEvent[]): FlockEvent[] {
+  const typeOrder: Record<FlockEvent["type"], number> = { registered: 0, turn: 1, closed: 2 };
+  return [...events].sort((left, right) => left.createdAt - right.createdAt || typeOrder[left.type] - typeOrder[right.type]);
+}
+
+function shouldRunStatusRefresh(statusEnabled: boolean, routeCount: number, intervalActive: boolean): boolean {
+  return !intervalActive && (statusEnabled || routeCount > 0);
+}
+
+function markFlockNodeClosed(id: string, closedAt = Date.now()) {
+  const node = flockNodes.get(id);
+  if (!node) return;
+  node.state = "closed";
+  node.closedAt = closedAt;
+}
+
+function pruneClosedFlockNodes(now: number, graceMs = 10_000) {
+  const hasOpenDescendant = (parentId: string): boolean => {
+    for (const node of flockNodes.values()) {
+      if (node.parentId !== parentId) continue;
+      if (node.state !== "closed" || hasOpenDescendant(node.id)) return true;
+    }
+    return false;
+  };
+  let removed = true;
+  while (removed) {
+    removed = false;
+    for (const [id, node] of flockNodes) {
+      if (node.state === "closed" && node.closedAt != null && now - node.closedAt > graceMs && !hasOpenDescendant(id)) {
+        flockNodes.delete(id);
+        removed = true;
+      }
+    }
+  }
+}
+
+function consumeFlockEvents(pi: ExtensionAPI) {
+  if (process.env.PI_SUBAGENT_ID) return;
+  for (const route of flockRoutes.values()) {
+    const events = orderFlockEvents(readFlockEvents(route.eventDir)
+      .flatMap((result) => result.ok ? [result.event] : []));
+    for (const event of events) {
+      if (route.seenEventIds.has(event.eventId)) continue;
+      if (event.rootId !== route.rootId) {
+        route.seenEventIds.add(event.eventId);
+        continue;
+      }
+      // Keep an out-of-order child event pending for the next scan instead of
+      // dropping it before the corresponding registration becomes visible.
+      if (event.type !== "registered" && !flockNodes.has(event.runId)) continue;
+      applyFlockEvent(event, pi);
+      route.seenEventIds.add(event.eventId);
+    }
+  }
 }
 
 /**
@@ -1543,10 +1710,11 @@ async function executeSubagentStart(
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+  if (!shouldRunStatusRefresh(statusConfig.enabled, flockRoutes.size, !!statusInterval)) return;
 
   statusInterval = setInterval(() => {
-    if (runningSubagents.size === 0) {
+    consumeFlockEvents(pi);
+    if (runningSubagents.size === 0 && (process.env.PI_SUBAGENT_ID || flockNodes.size === 0)) {
       if (statusInterval) {
         clearInterval(statusInterval);
         statusInterval = null;
@@ -1563,6 +1731,12 @@ function startStatusRefresh(pi: ExtensionAPI) {
       // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
       observeRunningSubagent(running, now);
       const projection = projectLifecycle(ensureLifecycle(running), now);
+      const node = flockNodes.get(running.id);
+      if (node) {
+        node.state = projection.kind === "active" || projection.kind === "starting" || projection.kind === "running" || projection.kind === "blocked"
+          ? "active"
+          : "waiting";
+      }
       const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
       if (running.lastProjectedKind !== projection.kind) {
         shouldRefreshWidget = true;
@@ -1573,7 +1747,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       // wake the parent session on stalled/recovered transitions — the user is
       // working in the subagent's pane, and a steer message here would burn an
       // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
-      if (transition && !running.interactive) {
+      if (statusConfig.enabled && transition && !running.interactive) {
         transitionLines.push(
           formatLifecycleTransitionLine(
             normalizeStatusName(running.name),
@@ -1587,7 +1761,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
     }
 
-    if (shouldRefreshWidget) updateWidget();
+    pruneClosedFlockNodes(now);
+    if (shouldRefreshWidget || flockNodes.size > 0) updateWidget();
 
     if (transitionLines.length > 0) {
       const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
@@ -1656,6 +1831,13 @@ export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
+  renderFlockWidgetLines,
+  orderFlockEvents,
+  shouldRunStatusRefresh,
+  markFlockNodeClosed,
+  pruneClosedFlockNodes,
+  flockNodes,
+  shouldRestoreFlockPresentation,
   loadAgentDefaults,
   assertPiOnlyAgentDefinition,
   createPiLaunchScriptOptions,
@@ -1749,6 +1931,13 @@ async function launchSubagent(
   if (!sessionFile) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+  const inheritedRootId = process.env.PI_FLOCK_ROOT_ID?.trim();
+  const rootId = inheritedRootId || id;
+  const parentId = process.env.PI_SUBAGENT_ID?.trim() || null;
+  const eventDir = process.env.PI_FLOCK_EVENT_DIR?.trim() || join(artifactDir, "flock-events", rootId);
+  if (!process.env.PI_SUBAGENT_ID) {
+    flockRoutes.set(rootId, { rootId, eventDir, seenEventIds: new Set() });
+  }
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
@@ -1852,7 +2041,13 @@ async function launchSubagent(
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
+  envParts.push(`PI_SUBAGENT_SESSION_ID=${shellQuote(sessionId)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
+  envParts.push(`PI_FLOCK_ROOT_ID=${shellQuote(rootId)}`);
+  envParts.push(`PI_FLOCK_EVENT_DIR=${shellQuote(eventDir)}`);
+  if (parentId) envParts.push(`PI_FLOCK_PARENT_ID=${shellQuote(parentId)}`);
+  envParts.push(`PI_FLOCK_RELAY_TURNS=${effectiveInteractive ? "1" : "0"}`);
+  envParts.push(`PI_SUBAGENT_INTERACTIVE=${effectiveInteractive ? "1" : "0"}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
   envParts.push(`PI_SUBAGENT_INBOX_FILE=${shellQuote(inboxFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
@@ -1915,6 +2110,20 @@ async function launchSubagent(
   };
 
     runningSubagents.set(id, running);
+    if (!process.env.PI_SUBAGENT_ID) {
+      flockNodes.set(id, {
+        id,
+        rootId,
+        parentId,
+        name: params.name,
+        agent: params.agent,
+        surface,
+        interactive: effectiveInteractive,
+        startTime,
+        direct: true,
+        state: "starting",
+      });
+    }
     registered = true;
     return running;
   } catch (error) {
@@ -2010,6 +2219,7 @@ async function watchSubagent(
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
+    markFlockNodeClosed(running.id);
 
     return {
       name,
@@ -2031,6 +2241,7 @@ async function watchSubagent(
       Date.now(),
       1,
     );
+    markFlockNodeClosed(running.id);
     updateWidget();
 
     if (signal.aborted) {
@@ -2055,6 +2266,10 @@ async function watchSubagent(
   }
 }
 
+function shouldRestoreFlockPresentation(runningCount: number, isChildProcess: boolean, nodeCount: number): boolean {
+  return runningCount > 0 || (!isChildProcess && nodeCount > 0);
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   runtime.pi = pi;
 
@@ -2065,7 +2280,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
     const refreshedGuidelines = buildSubagentRoutingGuidelines(runtime.modelCatalog);
     subagentRoutingGuidelines.splice(0, subagentRoutingGuidelines.length, ...refreshedGuidelines);
-    if (runningSubagents.size > 0) {
+    if (shouldRestoreFlockPresentation(runningSubagents.size, !!process.env.PI_SUBAGENT_ID, flockNodes.size)) {
       startWidgetRefresh();
       startStatusRefresh(pi);
       updateWidget();
@@ -2089,6 +2304,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
     if (!preserveSubagents) {
       completedResults.clear();
+      flockNodes.clear();
+      flockRoutes.clear();
     }
   });
 
@@ -2524,6 +2741,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+        const inheritedRootId = process.env.PI_FLOCK_ROOT_ID?.trim();
+        const rootId = inheritedRootId || id;
+        const parentId = process.env.PI_SUBAGENT_ID?.trim() || null;
+        const eventDir = process.env.PI_FLOCK_EVENT_DIR?.trim() || join(artifactDir, "flock-events", rootId);
+        if (!process.env.PI_SUBAGENT_ID) {
+          flockRoutes.set(rootId, { rootId, eventDir, seenEventIds: new Set() });
+        }
         const activityFile = getSubagentActivityFile(artifactDir, id);
         const inboxFile = getSubagentInboxFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
@@ -2555,7 +2779,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_DENY_TOOLS=${shellQuote([...SPAWNING_TOOLS].join(","))}`);
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_SESSION_ID=${shellQuote(sessionId)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
+        resumeEnvParts.push(`PI_FLOCK_ROOT_ID=${shellQuote(rootId)}`);
+        resumeEnvParts.push(`PI_FLOCK_EVENT_DIR=${shellQuote(eventDir)}`);
+        if (parentId) resumeEnvParts.push(`PI_FLOCK_PARENT_ID=${shellQuote(parentId)}`);
+        resumeEnvParts.push(`PI_FLOCK_RELAY_TURNS=${interactive ? "1" : "0"}`);
+        resumeEnvParts.push(`PI_SUBAGENT_INTERACTIVE=${interactive ? "1" : "0"}`);
+        resumeEnvParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
         resumeEnvParts.push(`PI_SUBAGENT_INBOX_FILE=${shellQuote(inboxFile)}`);
         if (autoExit) {
@@ -2584,6 +2815,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);
+        if (!process.env.PI_SUBAGENT_ID) {
+          flockNodes.set(id, {
+            id,
+            rootId,
+            parentId,
+            name,
+            surface,
+            interactive,
+            startTime,
+            direct: true,
+            state: "starting",
+          });
+        }
         registered = true;
         startWidgetRefresh();
         startStatusRefresh(pi);
@@ -2720,6 +2964,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("subagent_focus", {
+    description: "Focus a visible subagent by exact run id or name.",
+    handler: async (args, ctx) => {
+      if (process.env.PI_SUBAGENT_ID) {
+        ctx.ui.notify("Focus subagents from the root Pi session.", "warning");
+        return;
+      }
+      const target = args.trim();
+      const matches = Array.from(flockNodes.values()).filter((node) =>
+        node.state !== "closed" && (node.id === target || node.name === target),
+      );
+      if (!target) {
+        ctx.ui.notify("Usage: /subagent_focus <exact run id or name>", "warning");
+        return;
+      }
+      if (matches.length !== 1) {
+        ctx.ui.notify(matches.length ? "Ambiguous subagent name. Use its run id." : "No open tracked subagent found.", "warning");
+        return;
+      }
+      try {
+        focusPane(matches[0].surface);
+      } catch (error) {
+        ctx.ui.notify(`Could not focus ${matches[0].name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
@@ -2750,8 +3021,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── subagent_turn message renderer ──
+  pi.registerMessageRenderer("subagent_turn", (message, options, theme) => {
+    const details = message.details as any;
+    const text = typeof details?.text === "string" ? details.text : typeof message.content === "string" ? message.content : "";
+    const name = details?.name ?? "subagent";
+    return {
+      render(width: number): string[] {
+        const body = options.expanded ? text : text.split("\n").slice(0, 4).join("\n");
+        const lines = [
+          `${theme.fg("accent", "↳")} ${theme.fg("toolTitle", theme.bold(`${name} update`))}`,
+          ...body.split("\n").map((line: string) => theme.fg("dim", truncateToWidth(line, Math.max(0, width - 6)))),
+          ...(options.expanded ? [] : [theme.fg("muted", keyHint("app.tools.expand", "to expand"))]),
+        ];
+        const box = new Box(1, 1, (value: string) => theme.bg("customMessageBg", value));
+        box.addChild(new Text(lines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      },
+    };
+  });
+
   // ── subagent_result message renderer ──
-  pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
+  pi.registerMessageRenderer("subagent_result",  (message, options, theme) => {
     const details = message.details as any;
     if (!details) return undefined;
 
