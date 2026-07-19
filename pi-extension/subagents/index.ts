@@ -253,6 +253,7 @@ const SPAWNING_TOOLS = new Set([
   "subagent_message",
   "ping_subagents",
   "subagent_interrupt",
+  "subagent_stop",
   "subagents_list",
   "subagent_resume",
 ]);
@@ -572,6 +573,8 @@ interface SubagentResult {
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
+  /** True when a caller intentionally terminated this child. */
+  stopped?: boolean;
 }
 
 /**
@@ -595,6 +598,8 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /** A caller requested permanent Herdr-pane closure rather than turn interrupt. */
+  stopRequested?: boolean;
   /**
    * Optional legacy status snapshot retained only for hydrating pre-lifecycle
    * runtime entries after /reload. Live observation uses `lifecycle` only.
@@ -1038,6 +1043,31 @@ function shouldRunStatusRefresh(statusEnabled: boolean, routeCount: number, inte
   return !intervalActive && (statusEnabled || routeCount > 0);
 }
 
+function getFlockStopFile(eventDir: string, id: string): string {
+  return join(eventDir, "control", `${id}.stop`);
+}
+
+function requestFlockStop(eventDir: string | undefined, id: string): boolean {
+  if (!eventDir) return false;
+  try {
+    const file = getFlockStopFile(eventDir, id);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, "stop\n", { mode: 0o600 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasFlockStopRequest(id: string): boolean {
+  const eventDir = process.env.PI_FLOCK_EVENT_DIR?.trim();
+  return !!eventDir && existsSync(getFlockStopFile(eventDir, id));
+}
+
+function shouldCloseSubagentSurface(stopRequested: boolean | undefined): boolean {
+  return !stopRequested;
+}
+
 function markFlockNodeClosed(id: string, closedAt = Date.now()) {
   const node = flockNodes.get(id);
   if (!node) return;
@@ -1265,6 +1295,80 @@ function requestSubagentInterrupt(
       error:
         `Failed to send Escape to subagent "${running.name}" via herdr: ` +
         `${error?.message ?? String(error)}`,
+    };
+  }
+}
+
+function resolveStopTarget(params: { id?: string; name?: string }):
+  | { running: RunningSubagent }
+  | { node: FlockNode }
+  | { error: string } {
+  const requestedId = params.id?.trim();
+  const requestedName = params.name?.trim();
+  if (!requestedId && !requestedName) return { error: "Provide a running subagent id or exact display name." };
+
+  // IDs are authoritative. Never fall through to a same-named target when a
+  // caller supplied an ID that no longer exists.
+  if (requestedId) {
+    const running = runningSubagents.get(requestedId);
+    if (running) return { running };
+    if (!process.env.PI_SUBAGENT_ID) {
+      const node = flockNodes.get(requestedId);
+      if (node && node.state !== "closed") return { node };
+    }
+    return { error: `No running subagent with id "${requestedId}".` };
+  }
+
+  const candidates = new Map<string, { running?: RunningSubagent; node?: FlockNode }>();
+  for (const running of runningSubagents.values()) {
+    if (running.name === requestedName) candidates.set(running.id, { running });
+  }
+  if (!process.env.PI_SUBAGENT_ID) {
+    for (const node of flockNodes.values()) {
+      if (node.name !== requestedName || node.state === "closed") continue;
+      const existing = candidates.get(node.id);
+      candidates.set(node.id, { ...existing, node });
+    }
+  }
+  if (candidates.size === 1) {
+    const candidate = candidates.values().next().value!;
+    return candidate.running ? { running: candidate.running } : { node: candidate.node! };
+  }
+  if (candidates.size > 1) {
+    return { error: `Ambiguous subagent name "${requestedName}". Matches: ${[...candidates.keys()].join(", ")}` };
+  }
+  return { error: `No running subagent named "${requestedName}".` };
+}
+
+function handleSubagentStop(params: { id?: string; name?: string }) {
+  const resolved = resolveStopTarget(params);
+  if ("error" in resolved) {
+    return { content: [{ type: "text" as const, text: resolved.error }], details: { error: resolved.error } };
+  }
+  const target = "running" in resolved ? resolved.running : resolved.node;
+  try {
+    const rootId = "node" in resolved ? resolved.node.rootId : flockNodes.get(target.id)?.rootId;
+    const route = !process.env.PI_SUBAGENT_ID && rootId
+      ? flockRoutes.get(rootId)
+      : undefined;
+    const markerWritten = requestFlockStop(route?.eventDir ?? process.env.PI_FLOCK_EVENT_DIR, target.id);
+    const isNested = "node" in resolved && !runningSubagents.has(target.id);
+    if (isNested && !markerWritten) {
+      throw new Error("Could not record the nested stop request; pane left open to avoid an untracked termination.");
+    }
+    closePane(target.surface);
+    if ("running" in resolved) resolved.running.stopRequested = true;
+    markFlockNodeClosed(target.id);
+    updateWidget();
+    return {
+      content: [{ type: "text" as const, text: `Stopped and closed subagent "${target.name}".` }],
+      details: { id: target.id, name: target.name, status: "stop_requested" },
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: "text" as const, text: `Could not stop subagent "${target.name}": ${message}` }],
+      details: { error: message, id: target.id, name: target.name },
     };
   }
 }
@@ -1946,10 +2050,15 @@ export const __test__ = {
   orderFlockEvents,
   shouldRunStatusRefresh,
   markFlockNodeClosed,
+  shouldCloseSubagentSurface,
+  getFlockStopFile,
+  requestFlockStop,
+  hasFlockStopRequest,
   pruneClosedFlockNodes,
   reconcileMissingFlockNodes,
   applyFlockEvent,
   flockNodes,
+  flockRoutes,
   runtime,
   shouldRestoreFlockPresentation,
   loadAgentDefaults,
@@ -1968,6 +2077,8 @@ export const __test__ = {
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
+  handleSubagentStop,
+  resolveStopTarget,
   normalizeAgentCompatParams,
   createStartedSubagentResult,
   handleGetSubagentResult,
@@ -2264,7 +2375,7 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await waitForCompletion(signal, {
+    let result = await waitForCompletion(signal, {
       intervalMs: 1000,
       sessionFile,
       readTerminalTail: () => readPaneAsync(surface, 5),
@@ -2280,6 +2391,12 @@ async function watchSubagent(
     });
 
     const detectedAt = Date.now();
+    const callerStopped = running.stopRequested || hasFlockStopRequest(running.id);
+    if (callerStopped) {
+      // An intentional stop is not a provider/agent failure. Suppress the
+      // normal completion delivery; the stop tool already acknowledged it.
+      result = { reason: result.reason, exitCode: 0 };
+    }
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
@@ -2329,11 +2446,13 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
+    if (callerStopped) summary = "Subagent stopped by caller.";
+    if (shouldCloseSubagentSurface(callerStopped)) closePane(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
     markFlockNodeClosed(running.id);
+    if (callerStopped) running.lifecycle = markDelivery(running.lifecycle, "suppressed");
 
     return {
       name,
@@ -2343,6 +2462,7 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
+      ...(callerStopped ? { stopped: true } : {}),
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
@@ -2650,6 +2770,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }),
       async execute(_toolCallId, params) {
         return handlePingSubagents(params);
+      },
+    });
+
+  // ── subagent_stop tool ──
+  if (shouldRegister("subagent_stop"))
+    pi.registerTool({
+      name: "subagent_stop",
+      label: "Stop Subagent",
+      description:
+        "Permanently stop a running subagent and close its Herdr pane. " +
+        "Use this when the caller asks to stop, terminate, or close an agent. " +
+        "For cancelling only the current turn while keeping the session open, use subagent_interrupt instead.",
+      promptSnippet:
+        "Permanently stop and close a subagent when the user asks to stop, terminate, or close it. " +
+        "Use subagent_interrupt only when the user wants to cancel the current turn but keep the session available.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+      }),
+      async execute(_toolCallId, params) {
+        return handleSubagentStop(params);
       },
     });
 

@@ -2625,6 +2625,7 @@ describe("tool registration", () => {
       "subagent_message",
       "ping_subagents",
       "subagent_interrupt",
+      "subagent_stop",
       "subagent_resume",
     ]) {
       assert.equal(denied.has(tool), true, tool);
@@ -3337,12 +3338,59 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_interrupt in the main session extension", () => {
+  it("registers separate interrupt and permanent stop tools", () => {
     const { api, registeredTools } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_stop"), true);
+  });
+
+  it("closes a stopped subagent pane instead of only interrupting its turn", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const flockNodes = testApi.flockNodes as Map<string, any>;
+    const flockRoutes = testApi.flockRoutes as Map<string, any>;
+    const closed: string[] = [];
+    const stopDir = createTestDir();
+    const restoreTerminalHooks = terminalTest.setHooks({ closePane: (paneId) => closed.push(paneId) });
+    runningMap.clear();
+    flockNodes.clear();
+    const running = makeRunning();
+    runningMap.set(running.id, running);
+    flockNodes.set(running.id, { id: running.id, state: "active" });
+    try {
+      const result = testApi.handleSubagentStop({ id: running.id });
+      assert.equal(result.details.status, "stop_requested");
+      assert.deepEqual(closed, ["pane-1"]);
+      assert.equal(running.stopRequested, true);
+      assert.equal(flockNodes.get(running.id).state, "closed");
+      assert.equal(testApi.shouldCloseSubagentSurface(running.stopRequested), false);
+      assert.equal(testApi.shouldCloseSubagentSurface(false), true);
+      runningMap.set("second", makeRunning({ id: "second", name: "Worker", surface: "pane-2" }));
+      flockNodes.set("descendant", { id: "descendant", rootId: "root", name: "Worker", surface: "pane-3", state: "active" });
+      flockRoutes.set("root", { eventDir: stopDir });
+      assert.match(testApi.handleSubagentStop({ name: "Worker" }).details.error, /Ambiguous subagent name/);
+      assert.match(testApi.handleSubagentStop({ id: "missing", name: "Worker" }).details.error, /No running subagent with id/);
+      runningMap.clear();
+      const nestedStop = testApi.handleSubagentStop({ id: "descendant" });
+      assert.equal(nestedStop.details.status, "stop_requested");
+      assert.equal(existsSync(testApi.getFlockStopFile(stopDir, "descendant")), true);
+      const blockedEventDir = join(stopDir, "blocked");
+      writeFileSync(blockedEventDir, "not a directory");
+      flockNodes.set("broken", { id: "broken", rootId: "broken-root", name: "Broken", surface: "pane-4", state: "active" });
+      flockRoutes.set("broken-root", { eventDir: blockedEventDir });
+      const failedNestedStop = testApi.handleSubagentStop({ id: "broken" });
+      assert.match(failedNestedStop.details.error, /Could not record the nested stop request/);
+      assert.equal(closed.includes("pane-4"), false);
+    } finally {
+      restoreTerminalHooks();
+      runningMap.clear();
+      flockNodes.clear();
+      flockRoutes.clear();
+      rmSync(stopDir, { recursive: true, force: true });
+    }
   });
 
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
