@@ -1045,14 +1045,20 @@ function normalizeAgentCompatParams(params: Static<typeof AgentCompatParams>):
 function createStartedSubagentResult(
   running: RunningSubagent,
   params: Static<typeof SubagentParams>,
-  options: { includeSubagentId?: boolean } = {},
+  options: { includeSubagentId?: boolean; alreadyRunning?: boolean } = {},
 ) {
+  const resultName = options.alreadyRunning ? running.name : params.name;
+  const resultTask = options.alreadyRunning ? running.task : params.task;
+  const resultAgent = options.alreadyRunning ? running.agent : params.agent;
+
   return {
     content: [
       {
         type: "text" as const,
         text:
-          `Sub-agent "${params.name}" launched and is now running in the background. ` +
+          (options.alreadyRunning
+            ? `Sub-agent "${running.name}" is already running; reusing the existing Herdr pane instead of launching a duplicate. `
+            : `Sub-agent "${params.name}" launched and is now running in the background. `) +
           `Do NOT generate or assume any results - you have no idea what the sub-agent will do or produce. ` +
           `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
           `Until then, move on to other work or tell the user you're waiting.`,
@@ -1061,15 +1067,15 @@ function createStartedSubagentResult(
     details: {
       id: running.id,
       ...(options.includeSubagentId ? { subagent_id: running.id } : {}),
-      name: params.name,
-      task: params.task,
-      agent: params.agent,
+      name: resultName,
+      task: resultTask,
+      agent: resultAgent,
       sessionFile: running.sessionFile,
       launchScriptFile: running.launchScriptFile,
       model: running.runtimePlan?.model,
       thinking: running.runtimePlan?.thinking,
       runtimePlan: running.runtimePlan,
-      status: "started",
+      status: options.alreadyRunning ? "already_running" : "started",
     },
   };
 }
@@ -1267,11 +1273,47 @@ function handlePingSubagents(params: { includeInteractive?: boolean; message?: s
   };
 }
 
+function hasReuseBlockingOverrides(params: Static<typeof SubagentParams>): boolean {
+  return Boolean(
+    params.model ||
+      params.thinking ||
+      params.cwd ||
+      params.tools ||
+      params.skills ||
+      params.systemPrompt ||
+      params.fork != null ||
+      params.interactive != null
+  );
+}
+
+function findReusableRunningSubagent(params: Static<typeof SubagentParams>): RunningSubagent | null {
+  if (hasReuseBlockingOverrides(params)) return null;
+
+  const exactName = Array.from(runningSubagents.values()).filter((running) =>
+    running.name === params.name && running.agent === params.agent
+  );
+  if (exactName.length === 1) return exactName[0];
+  if (params.agent) {
+    const sameAgent = Array.from(runningSubagents.values()).filter((running) => running.agent === params.agent);
+    if (sameAgent.length === 1) return sameAgent[0];
+  }
+  return null;
+}
+
+function formatChildPaneLabel(name: string, ctx: any): string {
+  let sessionId: string | undefined;
+  try {
+    sessionId = ctx.sessionManager?.getSessionId?.();
+  } catch {}
+  const parent = sessionId?.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 8);
+  return parent ? `π:${parent} › ${name}` : name;
+}
+
 async function executeSubagentStart(
   params: Static<typeof SubagentParams>,
   pi: ExtensionAPI,
   ctx: any,
-  options: { includeSubagentId?: boolean } = {},
+  options: { includeSubagentId?: boolean; reuseExisting?: boolean } = {},
 ) {
   const currentAgent = process.env.PI_SUBAGENT_AGENT;
   if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -1284,6 +1326,11 @@ async function executeSubagentStart(
       ],
       details: { error: "self-spawn blocked" },
     };
+  }
+
+  if (options.reuseExisting) {
+    const existing = findReusableRunningSubagent(params);
+    if (existing) return createStartedSubagentResult(existing, params, { ...options, alreadyRunning: true });
   }
 
   if (!isTerminalAvailable()) return muxUnavailableResult();
@@ -1532,10 +1579,14 @@ export const __test__ = {
   requestSubagentInterrupt,
   handleSubagentInterrupt,
   normalizeAgentCompatParams,
+  createStartedSubagentResult,
   handleGetSubagentResult,
   handleSteerSubagent,
   handlePingSubagents,
   storeCompletedSubagentResult,
+  findReusableRunningSubagent,
+  hasReuseBlockingOverrides,
+  formatChildPaneLabel,
   completedResults,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
@@ -1616,7 +1667,7 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = options?.surface !== undefined;
-  const surface = options?.surface ?? createSubagentPane(params.name);
+  const surface = options?.surface ?? createSubagentPane(formatChildPaneLabel(params.name, ctx));
   let registered = false;
 
   try {
@@ -2055,7 +2106,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if ("error" in normalized) {
           return { content: [{ type: "text" as const, text: normalized.error }], details: { error: normalized.error } };
         }
-        return executeSubagentStart(normalized.params, pi, ctx, { includeSubagentId: true });
+        return executeSubagentStart(normalized.params, pi, ctx, { includeSubagentId: true, reuseExisting: true });
       },
 
       renderCall(args, theme) {
@@ -2343,7 +2394,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSubagentPane(name);
+        const surface = createSubagentPane(formatChildPaneLabel(name, ctx));
         let registered = false;
 
         try {

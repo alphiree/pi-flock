@@ -1192,7 +1192,7 @@ describe("subagent discovery", () => {
         Date.now = originalNow;
       }
 
-      assert.deepEqual(createdNames, [name, name]);
+      assert.deepEqual(createdNames, [`π:parent-s › ${name}`, `π:parent-s › ${name}`]);
       assert.deepEqual(dispatched.map((entry) => entry.paneId), ["mock-resume-surface", "mock-resume-surface"]);
       const script = readFileSync(result.details.launchScriptFile, "utf8");
       assertHostileValuesAreAbsentFromLaunchScriptMetadata(
@@ -1267,7 +1267,7 @@ describe("subagent discovery", () => {
         ),
         /launch dispatch failed/,
       );
-      assert.deepEqual(created, ["New launch"]);
+      assert.deepEqual(created, ["π:parent-s › New launch"]);
       assert.deepEqual(closed, ["new-launch-surface"]);
       assert.equal(runningMap.size, 0);
     } finally {
@@ -1419,7 +1419,7 @@ describe("subagent discovery", () => {
         ),
         /resume dispatch failed/,
       );
-      assert.deepEqual(created, ["New resume"]);
+      assert.deepEqual(created, ["π:parent-s › New resume"]);
       assert.ok(closed.includes("new-resume-surface"));
       assert.equal(runningMap.size, 0);
     } finally {
@@ -2657,6 +2657,81 @@ describe("tool registration", () => {
     const output = rendered.render(80).join("\n");
 
     assert.match(output, /\(unnamed\)/);
+  });
+
+  it("formats child pane labels with a parent session prefix without changing agent name", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(
+      testApi.formatChildPaneLabel("Planner", { sessionManager: { getSessionId: () => "abc12345-very-long" } }),
+      "π:abc12345 › Planner",
+    );
+    assert.equal(testApi.formatChildPaneLabel("Planner", { sessionManager: {} }), "Planner");
+  });
+
+  it("reuses an existing running Agent target instead of duplicating it", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    const running = {
+      id: "planner-existing",
+      name: "Planner",
+      agent: "planner",
+      task: "plan",
+      surface: "pane-planner",
+      sessionFile: "/tmp/planner.jsonl",
+      lifecycle: createLifecycle(1_000),
+    };
+    runningMap.set(running.id, running);
+
+    assert.equal(
+      testApi.findReusableRunningSubagent({ name: "Planner", agent: "planner", task: "new plan" })?.id,
+      running.id,
+    );
+    assert.equal(
+      testApi.findReusableRunningSubagent({ name: "Planner", agent: "reviewer", task: "review" }),
+      null,
+    );
+    assert.equal(
+      testApi.findReusableRunningSubagent({ name: "Planner", task: "unnamed request" }),
+      null,
+    );
+    assert.equal(
+      testApi.findReusableRunningSubagent({ name: "Other Planner", agent: "planner", task: "new plan" })?.id,
+      running.id,
+    );
+    assert.equal(
+      testApi.findReusableRunningSubagent({
+        name: "Other Planner",
+        agent: "planner",
+        task: "new plan",
+        model: "openai-codex/gpt-5.5",
+      }),
+      null,
+    );
+    assert.equal(testApi.hasReuseBlockingOverrides({ name: "Planner", agent: "planner", task: "plain" }), false);
+    assert.equal(testApi.hasReuseBlockingOverrides({ name: "Planner", agent: "planner", task: "plain", cwd: "other" }), true);
+    runningMap.clear();
+  });
+
+  it("reports reused Agent metadata from the existing running subagent", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = {
+      id: "planner-existing",
+      name: "Planner",
+      agent: "planner",
+      task: "original plan",
+      sessionFile: "/tmp/planner.jsonl",
+      runtimePlan: undefined,
+    };
+    const result = testApi.createStartedSubagentResult(
+      running,
+      { name: "Other Planner", agent: "planner", task: "new plan" },
+      { includeSubagentId: true, alreadyRunning: true },
+    );
+    assert.equal(result.details.status, "already_running");
+    assert.equal(result.details.name, "Planner");
+    assert.equal(result.details.task, "original plan");
+    assert.equal(result.details.agent, "planner");
   });
 
   it("registers subagent_resume with an autoExit override", () => {
