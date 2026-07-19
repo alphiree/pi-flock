@@ -13,7 +13,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pi-herdr-subagents-release
+  group: pi-flock-release
   cancel-in-progress: false
 
 jobs:
@@ -77,9 +77,9 @@ jobs:
         env:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
-          if npm view "pi-herdr-subagents@${VERSION}" version >/dev/null 2>&1; then
+          if npm view "pi-flock@${VERSION}" version >/dev/null 2>&1; then
             echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "pi-herdr-subagents@${VERSION} is already published; npm publish will be skipped."
+            echo "pi-flock@${VERSION} is already published; npm publish will be skipped."
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
@@ -135,7 +135,7 @@ jobs:
               --verify-tag \
               --title "$TAG" \
               --generate-notes \
-              --notes "Published package: [pi-herdr-subagents@${VERSION}](https://www.npmjs.com/package/pi-herdr-subagents/v/${VERSION})"
+              --notes "Published package: [pi-flock@${VERSION}](https://www.npmjs.com/package/pi-flock/v/${VERSION})"
           fi
 
       - name: Release summary
@@ -143,4 +143,4 @@ jobs:
           TAG: ${{ needs.detect.outputs.tag }}
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
-          echo "Released [$TAG](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}) and [pi-herdr-subagents@${VERSION}](https://www.npmjs.com/package/pi-herdr-subagents/v/${VERSION})." >> "$GITHUB_STEP_SUMMARY"
+          echo "Released [$TAG](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}) and [pi-flock@${VERSION}](https://www.npmjs.com/package/pi-flock/v/${VERSION})." >> "$GITHUB_STEP_SUMMARY"

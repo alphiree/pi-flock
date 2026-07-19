@@ -1,4 +1,4 @@
-# pi-herdr-subagents
+# pi-flock
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusively in [herdr](https://herdr.dev). Spawn, orchestrate, and manage sub-agent sessions in dedicated herdr tabs or panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
@@ -45,7 +45,7 @@ The full suite launches real Pi sessions and can take several minutes. `PI_TEST_
 Install the package from npm:
 
 ```bash
-pi install npm:pi-herdr-subagents
+pi install npm:pi-flock
 ```
 
 This project does not install or load `HazAT/pi-interactive-subagents` automatically.
@@ -243,7 +243,7 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
-> **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
+> **Note:** Only Pi-backed subagents are supported. Agent definitions that request `cli: claude` are rejected before launch.
 
 ---
 

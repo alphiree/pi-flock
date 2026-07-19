@@ -25,6 +25,7 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import { buildScriptContent, shellQuote } from "../pi-extension/subagents/terminal.ts";
 import {
   loadModelConfig,
   parseModelConfig,
@@ -654,14 +655,6 @@ describe("status.ts", () => {
     assert.equal(snapshot.waitingDurationText, "3m");
   });
 
-  it("uses elapsed-only fallback for claude-backed subagents", () => {
-    const state = createStatusState({ source: "claude", startTimeMs: 0 });
-    const snapshot = classifyStatus(state, 125_000);
-
-    assert.equal(snapshot.kind, "running");
-    assert.equal(snapshot.elapsedText, "2m");
-  });
-
   it("detects stalled transitions and recovery", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);
@@ -1032,6 +1025,51 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("rejects agent definitions that request the Claude CLI before creating a child", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+      writeAgentFile(projectAgentsDir, "claude-runtime-test-agent", "cli: claude");
+
+      await assert.rejects(
+        testApi.launchSubagent(
+          {
+            name: "Rejected child",
+            agent: "claude-runtime-test-agent",
+            task: "This must not launch.",
+          },
+          {
+            sessionManager: {
+              getSessionFile: () => join(projectDir, "parent.jsonl"),
+              getSessionId: () => "parent-session",
+              getSessionDir: () => projectDir,
+            },
+            cwd: projectDir,
+            model: { provider: "fake", id: "parent" },
+            modelRegistry: { find: () => undefined },
+          },
+          "medium",
+          { surface: "must-not-be-used" },
+        ),
+        /cli: "claude".*Pi subagents only/i,
+      );
+    });
+  });
+
+  it("keeps untrusted launch values out of generated script preambles", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const name = "worker\n# $(touch /tmp/pi-flock-name-injection); ; & | `whoami`";
+    const sessionPath = "/tmp/session;$(touch /tmp/pi-flock-session-injection)\n# session-path";
+    const options = testApi.createPiLaunchScriptOptions("/tmp/artifacts", "a1b2c3d4");
+    const command = `PI_SUBAGENT_NAME=${shellQuote(name)} pi --session ${shellQuote(sessionPath)}`;
+    const content = buildScriptContent(command, options.scriptPreamble);
+    const preamble = content.slice(0, content.indexOf(command));
+
+    assert.equal(options.scriptPath, "/tmp/artifacts/subagent-scripts/run-a1b2c3d4.sh");
+    assert.ok(content.includes(command));
+    assert.equal(preamble.includes(name), false);
+    assert.equal(preamble.includes(sessionPath), false);
+    assert.doesNotMatch(preamble, /touch|whoami|session-path/);
+  });
+
   it("resolves auto-exit and interactive behavior for named and bare spawns", () => {
     // Autonomous named agents are not interactive, so the parent gets status pings.
     assert.equal(
@@ -1122,26 +1160,28 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled agents inherit the parent runtime and preserve interaction modes", () => {
-    const expectedInteraction = {
-      scout: false,
-      worker: false,
-      reviewer: false,
-      planner: true,
-      "visual-tester": false,
-    } as const;
+  it("bundled agents inherit the parent runtime and preserve interaction modes", async () => {
+    await withIsolatedAgentEnv(() => {
+      const expectedInteraction = {
+        scout: false,
+        worker: false,
+        reviewer: false,
+        planner: true,
+        "visual-tester": false,
+      } as const;
 
-    for (const [name, interactive] of Object.entries(expectedInteraction)) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
-      assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        interactive,
-        `${name} should preserve its interaction mode`,
-      );
-    }
+      for (const [name, interactive] of Object.entries(expectedInteraction)) {
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
+        assert.equal(defs.thinking, undefined, `${name} should inherit the parent thinking level`);
+        assert.equal(
+          testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+          interactive,
+          `${name} should preserve its interaction mode`,
+        );
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -2463,31 +2503,6 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("rejects Claude-backed interrupt requests before delivery", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    let delivered = false;
-    runningMap.clear();
-
-    try {
-      runningMap.set("a1", makeRunning({ cli: "claude" }));
-
-      const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
-        delivered = true;
-      });
-
-      assert.equal(delivered, false);
-      assert.match(result.content[0].text, /currently supported only for Pi-backed subagents/i);
-      assert.deepEqual(result.details, {
-        error: "claude interrupt unsupported",
-        id: "a1",
-        name: "Worker",
-      });
-    } finally {
-      runningMap.clear();
-    }
-  });
-
   it("formats exit code 130 as an ordinary failure", () => {
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
@@ -2641,31 +2656,6 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
-  it("projects Claude agents as running and counts them as active", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const originalNow = Date.now;
-    Date.now = () => 30_000;
-    try {
-      const lines = testApi.renderSubagentWidgetLines([{
-        id: "c1",
-        name: "Claude",
-        task: "",
-        surface: "s1",
-        startTime: 5_000,
-        sessionFile: "sess1",
-        cli: "claude",
-        lifecycle: { ...createLifecycle(5_000), process: { kind: "running", startedAt: 5_000, confirmedAt: 5_000 } },
-        interactive: false,
-      }], 64);
-
-      assert.match(lines[0], /1 active/);
-      assert.ok(lines[0].includes("\x1b[38;2;77;163;255m"));
-      assert.match(lines[1], /running/);
-    } finally {
-      Date.now = originalNow;
-    }
-  });
-
   it("shows interrupted agents as open while process runtime continues", () => {
     const testApi = (subagentsModule as any).__test__;
     const interruptedAt = 20_000;

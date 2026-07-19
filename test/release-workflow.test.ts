@@ -13,5 +13,5 @@ test("release workflow reacts to package version changes and creates all release
   assert.match(workflow, /npm publish --access public --provenance/);
   assert.match(workflow, /gh release create "\$TAG"/);
   assert.match(workflow, /--generate-notes/);
-  assert.match(workflow, /npmjs\.com\/package\/pi-herdr-subagents\/v\/\$\{VERSION\}/);
+  assert.match(workflow, /npmjs\.com\/package\/pi-flock\/v\/\$\{VERSION\}/);
 });

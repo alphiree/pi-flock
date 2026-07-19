@@ -1,5 +1,5 @@
 /**
- * Integration test harness for pi-herdr-subagents.
+ * Integration test harness for pi-flock.
  *
  * Provides utilities to:
  * - Detect whether herdr is available

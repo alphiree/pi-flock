@@ -68,6 +68,13 @@ export function interruptPane(paneId: PaneId): void {
   sendHerdrEscape(paneId);
 }
 
+export function buildScriptContent(command: string, scriptPreamble?: string): string {
+  const scriptLines = ["#!/bin/bash"];
+  if (scriptPreamble) scriptLines.push(scriptPreamble.trimEnd());
+  scriptLines.push(command);
+  return `${scriptLines.join("\n")}\n`;
+}
+
 export function runScriptInPane(
   paneId: PaneId,
   command: string,
@@ -77,15 +84,12 @@ export function runScriptInPane(
     options?.scriptPath ??
     join(
       tmpdir(),
-      "pi-herdr-subagent-scripts",
+      "pi-flock-subagent-scripts",
       `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
     );
   mkdirSync(dirname(scriptPath), { recursive: true });
 
-  const scriptLines = ["#!/bin/bash"];
-  if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
-  scriptLines.push(command);
-  writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
+  writeFileSync(scriptPath, buildScriptContent(command, options?.scriptPreamble), { mode: 0o755 });
 
   runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
   return scriptPath;

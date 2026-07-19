@@ -1,15 +1,19 @@
 {
-  "name": "pi-herdr-subagents",
+  "name": "pi-flock",
   "version": "0.1.5",
-  "description": "Interactive subagents for pi running in herdr",
+  "description": "Async Pi subagents running in herdr",
   "keywords": [
     "pi-package"
   ],
   "license": "MIT",
-  "author": "0xRichardH",
+  "author": "alphire",
   "repository": {
     "type": "git",
-    "url": "https://github.com/0xRichardH/pi-herdr-subagents"
+    "url": "https://github.com/alphiree/pi-flock"
+  },
+  "homepage": "https://github.com/alphiree/pi-flock#readme",
+  "bugs": {
+    "url": "https://github.com/alphiree/pi-flock/issues"
   },
   "type": "module",
   "scripts": {

@@ -8,7 +8,7 @@ The published version must be unique on npm.
 
 You need:
 
-- Publish access to the `pi-herdr-subagents` package on npm
+- Publish access to the `pi-flock` package on npm
 - Permission to manage this repository's GitHub Actions secrets
 - A clean local `main` branch
 
@@ -61,16 +61,16 @@ You can rerun a failed or incomplete release from **Actions → Release → Run 
 After the workflow succeeds, inspect the published package:
 
 ```bash
-npm view pi-herdr-subagents
+npm view pi-flock
 ```
 
 Test installation through Pi:
 
 ```bash
-pi install npm:pi-herdr-subagents
+pi install npm:pi-flock
 ```
 
-The package should appear at <https://pi.dev/packages/pi-herdr-subagents> after the gallery indexes the npm release.
+The package should appear at <https://pi.dev/packages/pi-flock> after the gallery indexes the npm release.
 
 ## Troubleshooting
 
