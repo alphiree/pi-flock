@@ -2875,6 +2875,70 @@ describe("tool registration", () => {
     flockNodes.clear();
   });
 
+  it("closes vanished descendant panes but retains nodes on unavailable inspection", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const flockNodes = testApi.flockNodes as Map<string, any>;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const restoreTerminalHooks = terminalTest.setHooks({
+      inspectPane: async (paneId) => paneId === "gone" ? { kind: "missing", error: "closed" } : { kind: "unavailable", error: "offline" },
+    });
+    flockNodes.clear();
+    runningMap.clear();
+    flockNodes.set("gone", { id: "gone", surface: "gone", state: "active" });
+    flockNodes.set("unknown", { id: "unknown", surface: "unknown", state: "active" });
+    try {
+      assert.equal(await testApi.reconcileMissingFlockNodes(123), true);
+      assert.equal(flockNodes.get("gone").state, "closed");
+      assert.equal(flockNodes.get("gone").closedAt, 123);
+      assert.equal(flockNodes.get("unknown").state, "active");
+      testApi.applyFlockEvent({
+        version: 1,
+        eventId: "late-turn",
+        createdAt: 124,
+        rootId: "root",
+        runId: "gone",
+        parentId: null,
+        sessionId: "session",
+        agentId: "planner",
+        agentName: "Gone",
+        interactive: true,
+        surface: "gone",
+        type: "turn",
+        turnId: "turn",
+        phase: "completed",
+        text: "late",
+      }, { sendMessage: () => assert.fail("closed nodes must not relay late turns") });
+      assert.equal(flockNodes.get("gone").state, "closed");
+    } finally {
+      restoreTerminalHooks();
+      flockNodes.clear();
+      runningMap.clear();
+    }
+  });
+
+  it("does not apply a stale missing-pane result after reload generation changes", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const flockNodes = testApi.flockNodes as Map<string, any>;
+    const runtime = testApi.runtime as any;
+    let resolveInspection!: (value: any) => void;
+    const inspection = new Promise((resolve) => { resolveInspection = resolve; });
+    const restoreTerminalHooks = terminalTest.setHooks({ inspectPane: async () => inspection } as any);
+    flockNodes.clear();
+    flockNodes.set("stale", { id: "stale", surface: "stale", state: "active" });
+    runtime.statusRefreshGeneration = 10;
+    try {
+      const reconciliation = testApi.reconcileMissingFlockNodes(123, 10);
+      runtime.statusRefreshGeneration = 11;
+      resolveInspection({ kind: "missing", error: "closed" });
+      assert.equal(await reconciliation, false);
+      assert.equal(flockNodes.get("stale").state, "active");
+    } finally {
+      restoreTerminalHooks();
+      flockNodes.clear();
+      runtime.statusRefreshGeneration = 0;
+    }
+  });
+
   it("navigates the root flock with arrows and focuses the selected Herdr pane", () => {
     const testApi = (subagentsModule as any).__test__;
     const flockNodes = testApi.flockNodes as Map<string, any>;

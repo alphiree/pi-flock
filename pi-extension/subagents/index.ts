@@ -656,6 +656,9 @@ interface SubagentRuntime {
   fleetUnsubscribe?: () => void;
   fleetActive?: boolean;
   fleetSelectedId?: string;
+  flockReconcileInFlight?: boolean;
+  statusRefreshInFlight?: boolean;
+  statusRefreshGeneration?: number;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -1000,6 +1003,7 @@ function applyFlockEvent(event: FlockEvent, pi: ExtensionAPI) {
 
   const node = existing;
   if (!node) return;
+  if (node.state === "closed" && event.type !== "registered") return;
   if (event.type === "closed") {
     node.state = "closed";
     node.closedAt = event.createdAt;
@@ -1059,6 +1063,31 @@ function pruneClosedFlockNodes(now: number, graceMs = 10_000) {
       }
     }
   }
+}
+
+async function reconcileMissingFlockNodes(now: number, generation = runtime.statusRefreshGeneration ?? 0): Promise<boolean> {
+  if (process.env.PI_SUBAGENT_ID || runtime.flockReconcileInFlight) return false;
+  runtime.flockReconcileInFlight = true;
+  let closedAny = false;
+  try {
+    const nodes = Array.from(flockNodes.values()).filter((node) =>
+      node.state !== "closed" && !runningSubagents.has(node.id),
+    );
+    await Promise.all(nodes.map(async (node) => {
+      try {
+        const inspection = await inspectPane(node.surface);
+        if (inspection.kind === "missing" && (runtime.statusRefreshGeneration ?? 0) === generation) {
+          markFlockNodeClosed(node.id, now);
+          closedAny = true;
+        }
+      } catch {
+        // Inspection failures are not closure evidence.
+      }
+    }));
+  } finally {
+    runtime.flockReconcileInFlight = false;
+  }
+  return closedAny;
 }
 
 function consumeFlockEvents(pi: ExtensionAPI) {
@@ -1782,7 +1811,11 @@ async function executeSubagentStart(
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!shouldRunStatusRefresh(statusConfig.enabled, flockRoutes.size, !!statusInterval)) return;
 
-  statusInterval = setInterval(() => {
+  statusInterval = setInterval(async () => {
+    if (runtime.statusRefreshInFlight) return;
+    runtime.statusRefreshInFlight = true;
+    const generation = runtime.statusRefreshGeneration ?? 0;
+    try {
     consumeFlockEvents(pi);
     if (runningSubagents.size === 0 && (process.env.PI_SUBAGENT_ID || flockNodes.size === 0)) {
       if (statusInterval) {
@@ -1831,6 +1864,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
     }
 
+    shouldRefreshWidget = (await reconcileMissingFlockNodes(now, generation)) || shouldRefreshWidget;
+    if ((runtime.statusRefreshGeneration ?? 0) !== generation) return;
     pruneClosedFlockNodes(now);
     if (shouldRefreshWidget || flockNodes.size > 0) updateWidget();
 
@@ -1845,6 +1880,9 @@ function startStatusRefresh(pi: ExtensionAPI) {
         },
         { triggerTurn: true, deliverAs: "steer" },
       );
+    }
+    } finally {
+      runtime.statusRefreshInFlight = false;
     }
   }, 1000);
 
@@ -1909,7 +1947,10 @@ export const __test__ = {
   shouldRunStatusRefresh,
   markFlockNodeClosed,
   pruneClosedFlockNodes,
+  reconcileMissingFlockNodes,
+  applyFlockEvent,
   flockNodes,
+  runtime,
   shouldRestoreFlockPresentation,
   loadAgentDefaults,
   assertPiOnlyAgentDefinition,
@@ -2369,6 +2410,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runtime.fleetUnsubscribe?.();
     runtime.fleetUnsubscribe = undefined;
     runtime.fleetActive = false;
+    runtime.statusRefreshGeneration = (runtime.statusRefreshGeneration ?? 0) + 1;
     runtime.fleetSelectedId = undefined;
     if (widgetInterval) {
       clearInterval(widgetInterval);

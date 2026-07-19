@@ -27,6 +27,7 @@ type TerminalTestHooks = {
   runInPane?: (paneId: PaneId, command: string) => void;
   closePane?: (paneId: PaneId) => void;
   focusPane?: (paneId: PaneId) => void;
+  inspectPane?: (paneId: PaneId) => Promise<import("./lifecycle.ts").PaneInspection>;
 };
 
 let testHooks: TerminalTestHooks | undefined;
@@ -137,6 +138,7 @@ export async function readPaneAsync(paneId: PaneId, lines = 50): Promise<string>
 export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
 
 export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.ts").PaneInspection> {
+  if (testHooks?.inspectPane) return testHooks.inspectPane(paneId);
   assertTerminalAvailable();
   const result = await inspectHerdrPane(paneId);
   if (result.kind === "present") {
