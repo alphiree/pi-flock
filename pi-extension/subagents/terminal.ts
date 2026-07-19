@@ -20,8 +20,16 @@ export type SplitDirection = "right" | "down";
 
 const SETUP_HINT = "Start pi inside herdr (`herdr`, then run `pi`).";
 
+type TerminalTestHooks = {
+  isTerminalAvailable?: () => boolean;
+  createSubagentPane?: (name: string) => PaneId;
+  runInPane?: (paneId: PaneId, command: string) => void;
+};
+
+let testHooks: TerminalTestHooks | undefined;
+
 export function isTerminalAvailable(): boolean {
-  return isHerdrAvailable();
+  return testHooks?.isTerminalAvailable?.() ?? isHerdrAvailable();
 }
 
 export function terminalSetupHint(): string {
@@ -38,6 +46,7 @@ export function shellQuote(value: string): string {
 
 /** Create a new herdr tab and return its root pane ID. */
 export function createSubagentPane(name: string): PaneId {
+  if (testHooks?.createSubagentPane) return testHooks.createSubagentPane(name);
   assertTerminalAvailable();
   return createHerdrSurface(name);
 }
@@ -59,9 +68,20 @@ export function renameCurrentWorkspace(title: string): void {
 }
 
 export function runInPane(paneId: PaneId, command: string): void {
+  if (testHooks?.runInPane) return testHooks.runInPane(paneId, command);
   assertTerminalAvailable();
   sendHerdrCommand(paneId, command);
 }
+
+export const __test__ = {
+  setHooks(hooks: TerminalTestHooks): () => void {
+    const previous = testHooks;
+    testHooks = hooks;
+    return () => {
+      testHooks = previous;
+    };
+  },
+};
 
 export function interruptPane(paneId: PaneId): void {
   assertTerminalAvailable();

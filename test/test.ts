@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -25,7 +25,7 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
-import { buildScriptContent, shellQuote } from "../pi-extension/subagents/terminal.ts";
+import { __test__ as terminalTest } from "../pi-extension/subagents/terminal.ts";
 import {
   loadModelConfig,
   parseModelConfig,
@@ -154,6 +154,23 @@ function restoreEnvVar(name: string, value: string | undefined) {
     return;
   }
   process.env[name] = value;
+}
+
+function assertHostileValuesAreAbsentFromLaunchScriptMetadata(
+  scriptPath: string,
+  script: string,
+  commandStart: string,
+  hostileValues: string[],
+) {
+  const commandOffset = script.indexOf(commandStart);
+  assert.ok(commandOffset > 0, "expected the written script command after its preamble");
+
+  const preamble = script.slice(0, commandOffset);
+  const filename = basename(scriptPath);
+  for (const value of hostileValues) {
+    assert.equal(preamble.includes(value), false, `preamble must not contain ${JSON.stringify(value)}`);
+    assert.equal(filename.includes(value), false, `filename must not contain ${JSON.stringify(value)}`);
+  }
 }
 
 function withMockedNow<T>(now: number, fn: () => T): T {
@@ -1054,20 +1071,133 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("keeps untrusted launch values out of generated script preambles", () => {
+  it("keeps hostile launch inputs out of the real launch script preamble and filename", async () => {
     const testApi = (subagentsModule as any).__test__;
-    const name = "worker\n# $(touch /tmp/pi-flock-name-injection); ; & | `whoami`";
-    const sessionPath = "/tmp/session;$(touch /tmp/pi-flock-session-injection)\n# session-path";
-    const options = testApi.createPiLaunchScriptOptions("/tmp/artifacts", "a1b2c3d4");
-    const command = `PI_SUBAGENT_NAME=${shellQuote(name)} pi --session ${shellQuote(sessionPath)}`;
-    const content = buildScriptContent(command, options.scriptPreamble);
-    const preamble = content.slice(0, content.indexOf(command));
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const dir = createTestDir();
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const dispatched: Array<{ paneId: string; command: string }> = [];
+    const restoreTerminalHooks = terminalTest.setHooks({
+      runInPane(paneId, command) {
+        dispatched.push({ paneId, command });
+        assert.match(command, /^bash '/);
+        assert.ok(existsSync(command.slice(6, -1)), "script must be written before it is dispatched");
+      },
+    });
+    const name = "worker\n# $(id) ; & | `whoami`";
+    const sessionPath = join(dir, "parent;$(id)\n# session.jsonl");
+    const task = "complete this\n# $(id) ; & | `whoami`";
 
-    assert.equal(options.scriptPath, "/tmp/artifacts/subagent-scripts/run-a1b2c3d4.sh");
-    assert.ok(content.includes(command));
-    assert.equal(preamble.includes(name), false);
-    assert.equal(preamble.includes(sessionPath), false);
-    assert.doesNotMatch(preamble, /touch|whoami|session-path/);
+    process.env.PI_CODING_AGENT_DIR = join(dir, "agent-config");
+    mkdirSync(join(dir, ".pi", "agent"), { recursive: true });
+    writeFileSync(sessionPath, `${JSON.stringify(SESSION_HEADER)}\n`);
+    runningMap.clear();
+
+    try {
+      const surface = "supplied-launch-surface";
+      const running = await testApi.launchSubagent(
+        { name, task, fork: true, cwd: dir },
+        {
+          sessionManager: {
+            getSessionFile: () => sessionPath,
+            getSessionId: () => "parent-session",
+            getSessionDir: () => dir,
+          },
+          cwd: dir,
+          model: { provider: "fake", id: "parent" },
+          modelRegistry: { find: () => undefined },
+        },
+        "medium",
+        { surface },
+      );
+
+      assert.equal(running.surface, surface);
+      assert.deepEqual(dispatched.map((entry) => entry.paneId), [surface]);
+      const script = readFileSync(running.launchScriptFile, "utf8");
+      assertHostileValuesAreAbsentFromLaunchScriptMetadata(
+        running.launchScriptFile,
+        script,
+        "\ncd ",
+        [name, sessionPath, task],
+      );
+    } finally {
+      runningMap.clear();
+      restoreTerminalHooks();
+      restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps hostile resume inputs out of the registered tool handler's script preamble and filename", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const dir = createTestDir();
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousShellReadyDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const dispatched: Array<{ paneId: string; command: string }> = [];
+    const createdNames: string[] = [];
+    let shutdownHandlers: Function[] = [];
+    const restoreTerminalHooks = terminalTest.setHooks({
+      isTerminalAvailable: () => true,
+      createSubagentPane(name) {
+        createdNames.push(name);
+        return "mock-resume-surface";
+      },
+      runInPane(paneId, command) {
+        dispatched.push({ paneId, command });
+        assert.match(command, /^bash '/);
+        assert.ok(existsSync(command.slice(6, -1)), "script must be written before it is dispatched");
+      },
+    });
+    const name = "resume\n# $(id) ; & | `whoami`";
+    const sessionPath = join(dir, "resume;$(id)\n# session.jsonl");
+    const message = "continue this\n# $(id) ; & | `whoami`;";
+
+    process.env.PI_CODING_AGENT_DIR = join(dir, "agent-config");
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    writeFileSync(sessionPath, `${JSON.stringify(SESSION_HEADER)}\n`);
+    runningMap.clear();
+
+    try {
+      const { api, registeredTools, eventHandlers } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      shutdownHandlers = eventHandlers.get("session_shutdown") ?? [];
+      const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+      assert.ok(resumeTool, "expected subagent_resume tool to be registered");
+
+      const result = await resumeTool.execute(
+        "resume-call",
+        { name, sessionPath, message },
+        new AbortController().signal,
+        () => {},
+        {
+          sessionManager: {
+            getSessionId: () => "parent-session",
+            getSessionDir: () => dir,
+          },
+        },
+      );
+
+      assert.deepEqual(createdNames, [name]);
+      assert.deepEqual(dispatched.map((entry) => entry.paneId), ["mock-resume-surface"]);
+      const script = readFileSync(result.details.launchScriptFile, "utf8");
+      assertHostileValuesAreAbsentFromLaunchScriptMetadata(
+        result.details.launchScriptFile,
+        script,
+        "\nPI_CODING_AGENT_DIR=",
+        [name, sessionPath, message],
+      );
+
+    } finally {
+      for (const handler of shutdownHandlers) {
+        handler({ reason: "quit" }, {});
+      }
+      runningMap.clear();
+      restoreTerminalHooks();
+      restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", previousShellReadyDelay);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("resolves auto-exit and interactive behavior for named and bare spawns", () => {
