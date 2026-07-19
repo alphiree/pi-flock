@@ -24,6 +24,7 @@ type TerminalTestHooks = {
   isTerminalAvailable?: () => boolean;
   createSubagentPane?: (name: string) => PaneId;
   runInPane?: (paneId: PaneId, command: string) => void;
+  closePane?: (paneId: PaneId) => void;
 };
 
 let testHooks: TerminalTestHooks | undefined;
@@ -137,6 +138,7 @@ export async function inspectPane(paneId: PaneId): Promise<import("./lifecycle.t
 }
 
 export function closePane(paneId: PaneId): void {
+  if (testHooks?.closePane) return testHooks.closePane(paneId);
   assertTerminalAvailable();
   closeHerdrSurface(paneId);
 }

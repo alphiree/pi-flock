@@ -1200,6 +1200,293 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("closes a newly created launch pane when dispatch fails and preserves the dispatch error", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const dir = createTestDir();
+    const sessionPath = createSessionFile(dir, [SESSION_HEADER]);
+    const previousShellReadyDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const created: string[] = [];
+    const closed: string[] = [];
+    const restoreTerminalHooks = terminalTest.setHooks({
+      createSubagentPane(name) {
+        created.push(name);
+        return "new-launch-surface";
+      },
+      runInPane() {
+        throw new Error("launch dispatch failed");
+      },
+      closePane(surface) {
+        closed.push(surface);
+        throw new Error("cleanup failure must not replace dispatch error");
+      },
+    });
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    runningMap.clear();
+
+    try {
+      await assert.rejects(
+        testApi.launchSubagent(
+          { name: "New launch", task: "fail after creation" },
+          {
+            sessionManager: {
+              getSessionFile: () => sessionPath,
+              getSessionId: () => "parent-session",
+              getSessionDir: () => dir,
+            },
+            cwd: dir,
+            model: { provider: "fake", id: "parent" },
+            modelRegistry: { find: () => undefined },
+          },
+          "medium",
+        ),
+        /launch dispatch failed/,
+      );
+      assert.deepEqual(created, ["New launch"]);
+      assert.deepEqual(closed, ["new-launch-surface"]);
+      assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+      restoreTerminalHooks();
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", previousShellReadyDelay);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("closes a newly created launch pane when fork setup fails before dispatch", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const dir = createTestDir();
+    const missingSessionPath = join(dir, "missing-parent-session.jsonl");
+    const previousShellReadyDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const closed: string[] = [];
+    const restoreTerminalHooks = terminalTest.setHooks({
+      createSubagentPane() {
+        return "fork-setup-surface";
+      },
+      runInPane() {
+        assert.fail("fork setup failure must happen before command dispatch");
+      },
+      closePane(surface) {
+        closed.push(surface);
+      },
+    });
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    runningMap.clear();
+
+    try {
+      await assert.rejects(
+        testApi.launchSubagent(
+          { name: "Fork setup", task: "fail while seeding", fork: true },
+          {
+            sessionManager: {
+              getSessionFile: () => missingSessionPath,
+              getSessionId: () => "parent-session",
+              getSessionDir: () => dir,
+            },
+            cwd: dir,
+            model: { provider: "fake", id: "parent" },
+            modelRegistry: { find: () => undefined },
+          },
+          "medium",
+        ),
+        /ENOENT|no such file/i,
+      );
+      assert.deepEqual(closed, ["fork-setup-surface"]);
+      assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+      restoreTerminalHooks();
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", previousShellReadyDelay);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never closes a caller-provided launch surface when dispatch fails", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const dir = createTestDir();
+    const sessionPath = createSessionFile(dir, [SESSION_HEADER]);
+    const closed: string[] = [];
+    const restoreTerminalHooks = terminalTest.setHooks({
+      createSubagentPane() {
+        throw new Error("a caller-provided surface must not create another pane");
+      },
+      runInPane() {
+        throw new Error("provided-surface dispatch failed");
+      },
+      closePane(surface) {
+        closed.push(surface);
+      },
+    });
+    runningMap.clear();
+
+    try {
+      await assert.rejects(
+        testApi.launchSubagent(
+          { name: "Provided launch", task: "fail without owning surface" },
+          {
+            sessionManager: {
+              getSessionFile: () => sessionPath,
+              getSessionId: () => "parent-session",
+              getSessionDir: () => dir,
+            },
+            cwd: dir,
+            model: { provider: "fake", id: "parent" },
+            modelRegistry: { find: () => undefined },
+          },
+          "medium",
+          { surface: "caller-provided-surface" },
+        ),
+        /provided-surface dispatch failed/,
+      );
+      assert.deepEqual(closed, []);
+      assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+      restoreTerminalHooks();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("closes a newly created resume pane when dispatch fails", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const dir = createTestDir();
+    const sessionPath = createSessionFile(dir, [SESSION_HEADER]);
+    const previousShellReadyDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const created: string[] = [];
+    const closed: string[] = [];
+    const restoreTerminalHooks = terminalTest.setHooks({
+      isTerminalAvailable: () => true,
+      createSubagentPane(name) {
+        created.push(name);
+        return "new-resume-surface";
+      },
+      runInPane() {
+        throw new Error("resume dispatch failed");
+      },
+      closePane(surface) {
+        closed.push(surface);
+      },
+    });
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    runningMap.clear();
+
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+      assert.ok(resumeTool, "expected subagent_resume tool to be registered");
+
+      await assert.rejects(
+        resumeTool.execute(
+          "resume-call",
+          { name: "New resume", sessionPath },
+          new AbortController().signal,
+          () => {},
+          {
+            sessionManager: {
+              getSessionId: () => "parent-session",
+              getSessionDir: () => dir,
+            },
+          },
+        ),
+        /resume dispatch failed/,
+      );
+      assert.deepEqual(created, ["New resume"]);
+      assert.ok(closed.includes("new-resume-surface"));
+      assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+      restoreTerminalHooks();
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", previousShellReadyDelay);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("appends agent and caller system prompts in order without replacing Pi's prompt", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const dispatched: string[] = [];
+    const restoreTerminalHooks = terminalTest.setHooks({
+      runInPane(_paneId, command) {
+        dispatched.push(command);
+      },
+    });
+    runningMap.clear();
+
+    try {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
+        writeAgentFile(
+          projectAgentsDir,
+          "system-prompt-composition-test-agent",
+          [
+            "name: system-prompt-composition-test-agent",
+            "system-prompt: replace",
+          ].join("\n"),
+          "Agent Markdown body.",
+        );
+        const sessionPath = createSessionFile(projectDir, [SESSION_HEADER]);
+        const ctx = {
+          sessionManager: {
+            getSessionFile: () => sessionPath,
+            getSessionId: () => "parent-session",
+            getSessionDir: () => projectDir,
+          },
+          cwd: projectDir,
+          model: { provider: "fake", id: "parent" },
+          modelRegistry: { find: () => undefined },
+        };
+
+        const forkRunning = await testApi.launchSubagent(
+          {
+            name: "Prompt Composer",
+            agent: "system-prompt-composition-test-agent",
+            task: "fork task",
+            systemPrompt: "Caller system prompt.",
+            fork: true,
+          },
+          ctx,
+          "medium",
+          { surface: "fork-surface" },
+        );
+        const forkScript = readFileSync(forkRunning.launchScriptFile, "utf8");
+        const promptArtifacts = [...forkScript.matchAll(/--append-system-prompt '([^']+)'/g)]
+          .map((match) => match[1]);
+
+        assert.equal(promptArtifacts.length, 2);
+        assert.match(promptArtifacts[0], /-agent-sysprompt-/);
+        assert.match(promptArtifacts[1], /-caller-sysprompt-/);
+        assert.equal(readFileSync(promptArtifacts[0], "utf8"), "Agent Markdown body.");
+        assert.equal(readFileSync(promptArtifacts[1], "utf8"), "Caller system prompt.");
+        assert.doesNotMatch(forkScript, /(?:^|\s)--system-prompt(?:\s|$)/);
+        assert.match(forkScript, /'fork task'/);
+
+        const standaloneRunning = await testApi.launchSubagent(
+          {
+            name: "Prompt Composer",
+            agent: "system-prompt-composition-test-agent",
+            task: "standalone task",
+            systemPrompt: "Caller system prompt.",
+          },
+          ctx,
+          "medium",
+          { surface: "standalone-surface" },
+        );
+        const standaloneScript = readFileSync(standaloneRunning.launchScriptFile, "utf8");
+        const taskArtifact = [...standaloneScript.matchAll(/'@([^']+)'/g)].at(-1)?.[1];
+
+        assert.ok(taskArtifact, "standalone launch must deliver its task via an artifact");
+        assert.match(readFileSync(taskArtifact, "utf8"), /standalone task/);
+      });
+      assert.equal(dispatched.length, 2);
+    } finally {
+      runningMap.clear();
+      restoreTerminalHooks();
+    }
+  });
+
   it("resolves auto-exit and interactive behavior for named and bare spawns", () => {
     // Autonomous named agents are not interactive, so the parent gets status pings.
     assert.equal(

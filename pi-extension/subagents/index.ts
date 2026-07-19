@@ -1044,6 +1044,32 @@ function createPiLaunchScriptOptions(artifactDir: string, runId: string): {
   };
 }
 
+function createSystemPromptArtifacts(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  artifactDir: string,
+): string[] {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const safeName = params.name
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "") || "subagent";
+  const prompts: Array<[source: "agent" | "caller", content: string | undefined]> = [
+    ["agent", agentDefs?.body],
+    ["caller", params.systemPrompt],
+  ];
+
+  return prompts.flatMap(([source, content]) => {
+    if (content === undefined) return [];
+    const path = join(artifactDir, "context", `${safeName}-${source}-sysprompt-${timestamp}.md`);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content, "utf8");
+    return [path];
+  });
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1146,13 +1172,16 @@ async function launchSubagent(
 
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
+  const surfacePreCreated = options?.surface !== undefined;
   const surface = options?.surface ?? createSubagentPane(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  let registered = false;
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  try {
+    if (!surfacePreCreated) {
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
+
+    const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1177,13 +1206,9 @@ async function launchSubagent(
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
-  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-  const systemPromptMode = agentDefs?.systemPromptMode;
-  const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const fullTask = inheritsConversationContext
     ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+    : `\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // Pi CLI path
 
   // Build pi command
@@ -1200,22 +1225,11 @@ async function launchSubagent(
     parts.push("--thinking", shellQuote(effectiveThinking));
   }
 
-  // Pass agent body as system prompt via file to avoid shell escaping issues
-  // with multiline content. Pi's --append-system-prompt and --system-prompt
-  // auto-detect file paths and read their contents.
-  if (identityInSystemPrompt && identity) {
-    const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-    const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const spSafeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
-    mkdirSync(dirname(syspromptPath), { recursive: true });
-    writeFileSync(syspromptPath, identity, "utf8");
-    parts.push(flag, shellQuote(syspromptPath));
+  // Append each source independently. Pi's --append-system-prompt accepts a
+  // file path, avoiding shell escaping issues while retaining Pi's base prompt.
+  // Agent instructions are always appended before caller instructions.
+  for (const systemPromptPath of createSystemPromptArtifacts(params, agentDefs, artifactDir)) {
+    parts.push("--append-system-prompt", shellQuote(systemPromptPath));
   }
 
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
@@ -1305,8 +1319,19 @@ async function launchSubagent(
     lifecycle: createLifecycle(startTime),
   };
 
-  runningSubagents.set(id, running);
-  return running;
+    runningSubagents.set(id, running);
+    registered = true;
+    return running;
+  } catch (error) {
+    if (!surfacePreCreated && !registered) {
+      try {
+        closePane(surface);
+      } catch {
+        // Preserve the launch error when Herdr cleanup also fails.
+      }
+    }
+    throw error;
+  }
 }
 
 /**
@@ -1918,9 +1943,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSubagentPane(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        let registered = false;
 
-        // Build pi resume command
+        try {
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+
+          // Build pi resume command
         const parts = ["pi", "--session", shellQuote(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
@@ -1984,6 +2012,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);
+        registered = true;
         startWidgetRefresh();
         startStatusRefresh(pi);
 
@@ -2076,16 +2105,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           });
 
-        return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
-          details: {
-            id,
-            name,
-            sessionPath: params.sessionPath,
-            launchScriptFile,
-            status: "started",
-          },
-        };
+          return {
+            content: [{ type: "text", text: `Session "${name}" resumed.` }],
+            details: {
+              id,
+              name,
+              sessionPath: params.sessionPath,
+              launchScriptFile,
+              status: "started",
+            },
+          };
+        } catch (error) {
+          if (!registered) {
+            try {
+              closePane(surface);
+            } catch {
+              // Preserve the resume error when Herdr cleanup also fails.
+            }
+          }
+          throw error;
+        }
       },
     });
 
