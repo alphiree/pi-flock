@@ -1205,6 +1205,8 @@ describe("subagent discovery", () => {
       assert.ok(resumeMessagePath, "expected the resume message artifact argument");
       assert.match(basename(resumeMessagePath), /-[0-9a-f-]{36}\.md$/i);
       assert.equal(readFileSync(resumeMessagePath, "utf8"), message);
+      assert.match(script, /PI_DENY_TOOLS=.*Agent/);
+      assert.match(script, /PI_DENY_TOOLS=.*subagent/);
       const secondScript = readFileSync(secondResult.details.launchScriptFile, "utf8");
       const secondResumeMessagePath = secondScript.match(/'@([^']+)'/)?.[1];
       assert.ok(secondResumeMessagePath, "expected the second resume message artifact argument");
@@ -2447,13 +2449,193 @@ describe("tool registration", () => {
     });
   });
 
-  it("expands spawning false to deny subagent interruption", () => {
+  it("expands spawning false to deny compatibility subagent tools", () => {
     const testApi = (subagentsModule as any).__test__;
     const denied = testApi.resolveDenyTools({ spawning: false });
 
-    assert.equal(denied.has("subagent"), true);
-    assert.equal(denied.has("subagent_interrupt"), true);
-    assert.equal(denied.has("subagent_resume"), true);
+    for (const tool of [
+      "subagent",
+      "Agent",
+      "get_subagent_result",
+      "steer_subagent",
+      "ping_subagents",
+      "subagent_interrupt",
+      "subagent_resume",
+    ]) {
+      assert.equal(denied.has(tool), true, tool);
+    }
+  });
+
+  it("registers Agent compatibility and normalizes Tintin-style parameters", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    assert.ok(registeredTools.find((tool) => tool.name === "Agent"), "expected Agent tool");
+    assert.ok(registeredTools.find((tool) => tool.name === "get_subagent_result"), "expected result tool");
+    assert.ok(registeredTools.find((tool) => tool.name === "steer_subagent"), "expected steer tool");
+    assert.ok(registeredTools.find((tool) => tool.name === "ping_subagents"), "expected ping tool");
+
+    const normalized = testApi.normalizeAgentCompatParams({
+      subagent_type: "planner",
+      prompt: "Plan this",
+      description: "Planner run",
+      model: "openai-codex/gpt-5.5",
+      thinking: "medium",
+    });
+    assert.deepEqual(normalized, {
+      params: {
+        name: "Planner run",
+        task: "Plan this",
+        agent: "planner",
+        model: "openai-codex/gpt-5.5",
+        thinking: "medium",
+      },
+    });
+    assert.match(testApi.normalizeAgentCompatParams({ subagent_type: "planner" }).error, /prompt or task/);
+  });
+
+  it("stores runtime mismatch warnings in cached completed results", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const completedMap = testApi.completedResults as Map<string, any>;
+    completedMap.clear();
+    testApi.storeCompletedSubagentResult(
+      {
+        id: "runtime-warning",
+        name: "Runtime Warning",
+        task: "work",
+        sessionFile: "/tmp/runtime-warning.jsonl",
+        runtimePlan: { runtimeMismatch: "child used another model" },
+      },
+      {
+        name: "Runtime Warning",
+        task: "work",
+        summary: "done",
+        exitCode: 0,
+        elapsed: 1,
+        sessionFile: "/tmp/runtime-warning.jsonl",
+      },
+      "done\n\nRuntime warning: child used another model",
+    );
+
+    const result = testApi.handleGetSubagentResult({ id: "runtime-warning" });
+    assert.match(result.content[0].text, /Runtime warning: child used another model/);
+    completedMap.clear();
+  });
+
+  it("returns running and completed results through get_subagent_result", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const completedMap = testApi.completedResults as Map<string, any>;
+    runningMap.clear();
+    completedMap.clear();
+
+    const running = {
+      id: "run-compat",
+      name: "Compat Runner",
+      task: "work",
+      agent: "scout",
+      surface: "pane-1",
+      sessionFile: "/tmp/session.jsonl",
+      lifecycle: createLifecycle(1_000),
+    };
+    runningMap.set(running.id, running);
+    const runningResult = testApi.handleGetSubagentResult({ subagent_id: running.id });
+    assert.equal(runningResult.details.status, "running");
+    assert.equal(runningResult.details.subagent_id, running.id);
+
+    runningMap.delete(running.id);
+    testApi.storeCompletedSubagentResult(running, {
+      name: running.name,
+      task: running.task,
+      summary: "done",
+      exitCode: 0,
+      elapsed: 2,
+      sessionFile: running.sessionFile,
+    });
+    const completedResult = testApi.handleGetSubagentResult({ name: running.name });
+    assert.equal(completedResult.details.status, "completed");
+    assert.equal(completedResult.details.subagent_id, running.id);
+    assert.match(completedResult.content[0].text, /done|completed/i);
+
+    runningMap.clear();
+    completedMap.clear();
+  });
+
+  it("rejects direct steering without sending terminal text", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const completedMap = testApi.completedResults as Map<string, any>;
+    runningMap.clear();
+    completedMap.clear();
+    const running = {
+      id: "steer-compat",
+      name: "Steer Target",
+      task: "work",
+      surface: "pane-steer",
+      sessionFile: "/tmp/steer.jsonl",
+      lifecycle: createLifecycle(1_000),
+    };
+    runningMap.set(running.id, running);
+
+    const result = testApi.handleSteerSubagent({ subagent_id: running.id, message: "hello child" });
+    assert.equal(result.details.status, "unsupported");
+    assert.match(result.details.error, /unsafe terminal steering disabled/);
+    assert.match(result.content[0].text, /subagent_resume/);
+
+    runningMap.delete(running.id);
+    testApi.storeCompletedSubagentResult(running, {
+      name: running.name,
+      task: running.task,
+      summary: "done",
+      exitCode: 0,
+      elapsed: 1,
+      sessionFile: running.sessionFile,
+    });
+    const completed = testApi.handleSteerSubagent({ id: running.id, message: "too late" });
+    assert.match(completed.details.error, /already completed/);
+    const missing = testApi.handleSteerSubagent({ id: "missing", message: "hello" });
+    assert.match(missing.details.error, /No running subagent/);
+
+    runningMap.clear();
+    completedMap.clear();
+  });
+
+  it("observes non-interactive subagents by default and can include interactive ones", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    runningMap.set("auto", {
+      id: "auto",
+      name: "Auto",
+      task: "work",
+      surface: "pane-auto",
+      sessionFile: "/tmp/auto.jsonl",
+      interactive: false,
+      lifecycle: createLifecycle(1_000),
+    });
+    runningMap.set("interactive", {
+      id: "interactive",
+      name: "Interactive",
+      task: "work",
+      surface: "pane-interactive",
+      sessionFile: "/tmp/interactive.jsonl",
+      interactive: true,
+      lifecycle: createLifecycle(1_000),
+    });
+
+    const defaultPing = testApi.handlePingSubagents({});
+    assert.equal(defaultPing.details.agents.find((agent: any) => agent.id === "auto").status, "observed");
+    assert.equal(defaultPing.details.agents.find((agent: any) => agent.id === "interactive").status, "skipped_interactive");
+
+    const allPing = testApi.handlePingSubagents({ includeInteractive: true });
+    assert.equal(allPing.details.agents.filter((agent: any) => agent.status === "observed").length, 2);
+
+    const customMessage = testApi.handlePingSubagents({ message: "execute this" });
+    assert.equal(customMessage.details.status, "unsupported");
+    assert.match(customMessage.details.error, /custom ping message unsupported/);
+
+    runningMap.clear();
   });
 
   it("renders partial subagent tool-call args without throwing", () => {
@@ -2491,6 +2673,24 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("clears completed result cache on final shutdown but not reload", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const completedMap = testApi.completedResults as Map<string, any>;
+    completedMap.clear();
+    completedMap.set("done", { id: "done", name: "Done" });
+
+    let agents = new Map();
+    cleanupSubagentsForShutdown("reload", agents);
+    assert.equal(completedMap.has("done"), true);
+
+    const { api, eventHandlers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const shutdown = eventHandlers.get("session_shutdown")?.[0];
+    assert.ok(shutdown);
+    shutdown({ reason: "quit" }, {});
+    assert.equal(completedMap.size, 0);
+  });
+
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
     const agents = new Map([["child", {

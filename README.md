@@ -4,7 +4,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusivel
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all tracked agents with their projected state — for example `starting`, `active`, `waiting`, `interrupted`, `stalled`, `running`, or `finalizing`. The header summarizes **active** (processing) vs **open** (not processing). When every tracked subagent is open, the border switches to amber. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` or the compatibility `Agent()` facade and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all tracked agents with their projected state — for example `starting`, `active`, `waiting`, `interrupted`, `stalled`, `running`, or `finalizing`. The header summarizes **active** (processing) vs **open** (not processing). When every tracked subagent is open, the border switches to amber. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────── 1 active · 1 open ─╮
@@ -18,7 +18,9 @@ For parallel execution, just call `subagent` multiple times — they all run con
 ```typescript
 subagent({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" });
 subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
-// Both return immediately, results steer back independently
+// Compatibility form:
+Agent({ description: "Planner", subagent_type: "planner", prompt: "Plan the feature" });
+// All return immediately; results steer back independently
 ```
 
 ## Development
@@ -67,7 +69,7 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent tabs and panes are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent tabs and panes are created without stealing keyboard focus. In normal production use, pi-flock creates a new tab in the **current Herdr workspace** (`herdr tab create --workspace <current>`), not a new workspace. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus. The integration test harness creates dedicated temporary Herdr workspaces only for test isolation and cleanup.
 
 ## What's Included
 
@@ -78,6 +80,10 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
+| `Agent`              | Compatibility alias for `subagent`; accepts `subagent_type`/`prompt` style fields           |
+| `get_subagent_result`| Non-blocking compatibility lookup for known running/completed subagents                      |
+| `steer_subagent`     | Compatibility placeholder that rejects unsafe direct terminal steering and points to resume  |
+| `ping_subagents`     | Non-blocking status observation for running subagent panes                                  |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
@@ -189,7 +195,7 @@ The copyable example is model-neutral, so it works without requiring credentials
 }
 ```
 
-`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
+`models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })` or `Agent({ subagent_type: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references. Production does not silently route to `openrouter/free`; that is only the integration harness default when `PI_TEST_MODEL` is omitted.
 
 `config.json` is gitignored so local overrides don't get committed.
 

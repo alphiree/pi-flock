@@ -160,6 +160,36 @@ const SubagentParams = Type.Object({
   ),
 });
 
+const AgentCompatParams = Type.Object({
+  subagent_type: Type.Optional(
+    Type.String({ description: "Compatibility alias for the named subagent definition." }),
+  ),
+  agent: Type.Optional(Type.String({ description: "Named subagent definition." })),
+  prompt: Type.Optional(Type.String({ description: "Compatibility alias for task." })),
+  task: Type.Optional(Type.String({ description: "Task/prompt for the sub-agent." })),
+  description: Type.Optional(Type.String({ description: "Compatibility display name." })),
+  name: Type.Optional(Type.String({ description: "Display name for the subagent." })),
+  systemPrompt: Type.Optional(
+    Type.String({ description: "Appended to system prompt (role instructions)" }),
+  ),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Exact authenticated provider/model-id. Omit to inherit the parent model. Select another model only when warranted.",
+    }),
+  ),
+  thinking: Type.Optional(ThinkingLevelSchema),
+  skills: Type.Optional(
+    Type.String({ description: "Comma-separated skills (overrides agent default)" }),
+  ),
+  tools: Type.Optional(
+    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
+  ),
+  cwd: Type.Optional(Type.String({ description: "Working directory for the sub-agent." })),
+  fork: Type.Optional(Type.Boolean({ description: "Force full-context fork mode." })),
+  interactive: Type.Optional(Type.Boolean({ description: "Mark the subagent as interactive." })),
+});
+
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
@@ -194,6 +224,10 @@ interface ListedAgentDefinition extends AgentDefinition {
 /** Tools that are gated by `spawning: false` */
 const SPAWNING_TOOLS = new Set([
   "subagent",
+  "Agent",
+  "get_subagent_result",
+  "steer_subagent",
+  "ping_subagents",
   "subagent_interrupt",
   "subagents_list",
   "subagent_resume",
@@ -555,15 +589,30 @@ interface RunningSubagent {
   runtimePlan: ResolvedRuntimePlan | undefined;
 }
 
+interface CompletedSubagentResult {
+  id: string;
+  name: string;
+  task: string;
+  agent?: string;
+  completedAt: number;
+  result: SubagentResult;
+  presentation: string;
+  runtimePlan: ResolvedRuntimePlan | undefined;
+}
+
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
+  completedResults: Map<string, CompletedSubagentResult>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
-  return { runningSubagents: new Map<string, RunningSubagent>() };
+  return {
+    runningSubagents: new Map<string, RunningSubagent>(),
+    completedResults: new Map<string, CompletedSubagentResult>(),
+  };
 }
 
 /** Runtime state preserved across /reload. */
@@ -571,6 +620,8 @@ const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
+const completedResults = runtime.completedResults ?? (runtime.completedResults = new Map<string, CompletedSubagentResult>());
+const MAX_COMPLETED_RESULTS = 50;
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
   return reason === "reload";
@@ -962,6 +1013,394 @@ function handleSubagentInterrupt(
   };
 }
 
+function pickString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeAgentCompatParams(params: Static<typeof AgentCompatParams>):
+  | { params: Static<typeof SubagentParams> }
+  | { error: string } {
+  const task = pickString(params.prompt) ?? pickString(params.task);
+  if (!task) return { error: "Agent requires a prompt or task." };
+
+  const agent = pickString(params.subagent_type) ?? pickString(params.agent);
+  const name = pickString(params.description) ?? pickString(params.name) ?? agent ?? "Agent";
+  return {
+    params: {
+      name,
+      task,
+      ...(agent ? { agent } : {}),
+      ...(params.systemPrompt ? { systemPrompt: params.systemPrompt } : {}),
+      ...(params.model ? { model: params.model } : {}),
+      ...(params.thinking ? { thinking: params.thinking } : {}),
+      ...(params.skills ? { skills: params.skills } : {}),
+      ...(params.tools ? { tools: params.tools } : {}),
+      ...(params.cwd ? { cwd: params.cwd } : {}),
+      ...(params.fork != null ? { fork: params.fork } : {}),
+      ...(params.interactive != null ? { interactive: params.interactive } : {}),
+    },
+  };
+}
+
+function createStartedSubagentResult(
+  running: RunningSubagent,
+  params: Static<typeof SubagentParams>,
+  options: { includeSubagentId?: boolean } = {},
+) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          `Sub-agent "${params.name}" launched and is now running in the background. ` +
+          `Do NOT generate or assume any results - you have no idea what the sub-agent will do or produce. ` +
+          `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
+          `Until then, move on to other work or tell the user you're waiting.`,
+      },
+    ],
+    details: {
+      id: running.id,
+      ...(options.includeSubagentId ? { subagent_id: running.id } : {}),
+      name: params.name,
+      task: params.task,
+      agent: params.agent,
+      sessionFile: running.sessionFile,
+      launchScriptFile: running.launchScriptFile,
+      model: running.runtimePlan?.model,
+      thinking: running.runtimePlan?.thinking,
+      runtimePlan: running.runtimePlan,
+      status: "started",
+    },
+  };
+}
+
+function storeCompletedSubagentResult(
+  running: RunningSubagent,
+  result: SubagentResult,
+  presentation = resolveResultPresentation(result, running.name),
+): CompletedSubagentResult {
+  const stored: CompletedSubagentResult = {
+    id: running.id,
+    name: running.name,
+    task: running.task,
+    ...(running.agent ? { agent: running.agent } : {}),
+    completedAt: Date.now(),
+    result,
+    presentation,
+    runtimePlan: running.runtimePlan,
+  };
+  if (completedResults.has(running.id)) completedResults.delete(running.id);
+  completedResults.set(running.id, stored);
+  while (completedResults.size > MAX_COMPLETED_RESULTS) {
+    const oldest = completedResults.keys().next().value;
+    if (oldest == null) break;
+    completedResults.delete(oldest);
+  }
+  return stored;
+}
+
+function resolveKnownSubagent(params: { id?: string; subagent_id?: string; name?: string }):
+  | { running: RunningSubagent }
+  | { completed: CompletedSubagentResult }
+  | { error: string } {
+  const requestedId = (params.id ?? params.subagent_id)?.trim();
+  if (requestedId) {
+    const running = runningSubagents.get(requestedId);
+    if (running) return { running };
+    const completed = completedResults.get(requestedId);
+    if (completed) return { completed };
+    return { error: `No known subagent with id "${requestedId}".` };
+  }
+
+  const requestedName = params.name?.trim();
+  if (!requestedName) return { error: "Provide a subagent id or exact display name." };
+
+  const runningMatches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
+  const completedMatches = Array.from(completedResults.values()).filter((completed) => completed.name === requestedName);
+  const matches = [...runningMatches.map((running) => ({ running })), ...completedMatches.map((completed) => ({ completed }))];
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) return { error: `No known subagent named "${requestedName}".` };
+
+  const candidates = [
+    ...runningMatches.map((running) => `${running.name} [${running.id}, running]`),
+    ...completedMatches.map((completed) => `${completed.name} [${completed.id}, completed]`),
+  ].join(", ");
+  return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
+}
+
+function handleGetSubagentResult(params: { id?: string; subagent_id?: string; name?: string }) {
+  const resolved = resolveKnownSubagent(params);
+  if ("error" in resolved) {
+    return { content: [{ type: "text" as const, text: resolved.error }], details: { error: resolved.error } };
+  }
+
+  if ("running" in resolved) {
+    const running = resolved.running;
+    observeRunningSubagent(running);
+    const projection = projectLifecycle(ensureLifecycle(running), Date.now());
+    return {
+      content: [{ type: "text" as const, text: `Sub-agent "${running.name}" is still running (${projection.kind}).` }],
+      details: {
+        id: running.id,
+        subagent_id: running.id,
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        sessionFile: running.sessionFile,
+        status: "running",
+        lifecycleStatus: projection.kind,
+      },
+    };
+  }
+
+  const completed = resolved.completed;
+  const failed = completed.result.exitCode !== 0 || !!completed.result.errorMessage || !!completed.result.error;
+  return {
+    content: [{ type: "text" as const, text: completed.presentation }],
+    details: {
+      id: completed.id,
+      subagent_id: completed.id,
+      name: completed.name,
+      task: completed.task,
+      agent: completed.agent,
+      sessionFile: completed.result.sessionFile,
+      exitCode: completed.result.exitCode,
+      elapsed: completed.result.elapsed,
+      status: failed ? "failed" : "completed",
+      completedAt: completed.completedAt,
+      result: completed.result,
+      runtimePlan: completed.runtimePlan,
+    },
+  };
+}
+
+function resolveSteerTarget(params: { id?: string; subagent_id?: string; name?: string }):
+  | { running: RunningSubagent }
+  | { error: string } {
+  const requestedId = (params.id ?? params.subagent_id)?.trim();
+  if (requestedId) {
+    const running = runningSubagents.get(requestedId);
+    if (running) return { running };
+    const completed = completedResults.get(requestedId);
+    if (completed) return { error: `Subagent "${completed.name}" [${requestedId}] has already completed.` };
+    return { error: `No running subagent with id "${requestedId}".` };
+  }
+
+  const requestedName = params.name?.trim();
+  if (!requestedName) return { error: "Provide a running subagent id or exact display name." };
+
+  const runningMatches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
+  if (runningMatches.length === 1) return { running: runningMatches[0] };
+  if (runningMatches.length > 1) {
+    const candidates = runningMatches.map((running) => `${running.name} [${running.id}]`).join(", ");
+    return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
+  }
+
+  const completedMatches = Array.from(completedResults.values()).filter((completed) => completed.name === requestedName);
+  if (completedMatches.length > 0) {
+    const candidates = completedMatches.map((completed) => `${completed.name} [${completed.id}]`).join(", ");
+    return { error: `Subagent "${requestedName}" has already completed. Matches: ${candidates}` };
+  }
+  return { error: `No running subagent named "${requestedName}".` };
+}
+
+function handleSteerSubagent(params: { id?: string; subagent_id?: string; name?: string; message?: string }) {
+  const message = pickString(params.message);
+  if (!message) {
+    return { content: [{ type: "text" as const, text: "Provide a non-empty message to send." }], details: { error: "missing message" } };
+  }
+
+  const resolved = resolveSteerTarget(params);
+  if ("error" in resolved) {
+    return { content: [{ type: "text" as const, text: resolved.error }], details: { error: resolved.error } };
+  }
+
+  const text =
+    "Direct terminal steering is disabled in this build because sending arbitrary text to a pane can execute in a shell if the child process exits between polls. " +
+    "Use subagent_resume with the returned session file for safe follow-up until a Pi IPC transport is implemented.";
+  return {
+    content: [{ type: "text" as const, text }],
+    details: {
+      error: "unsafe terminal steering disabled",
+      id: resolved.running.id,
+      subagent_id: resolved.running.id,
+      name: resolved.running.name,
+      status: "unsupported",
+      sessionFile: resolved.running.sessionFile,
+    },
+  };
+}
+
+function handlePingSubagents(params: { includeInteractive?: boolean; message?: string } = {}) {
+  if (pickString(params.message)) {
+    const text =
+      "Custom ping message delivery is disabled because direct terminal text steering is unsafe. " +
+      "ping_subagents only observes status; use subagent_resume for follow-up instructions.";
+    return { content: [{ type: "text" as const, text }], details: { error: "custom ping message unsupported", status: "unsupported" } };
+  }
+
+  const statuses = Array.from(runningSubagents.values()).map((running) => {
+    observeRunningSubagent(running);
+    const projection = projectLifecycle(ensureLifecycle(running), Date.now());
+    if (running.interactive && !params.includeInteractive) {
+      return {
+        id: running.id,
+        subagent_id: running.id,
+        name: running.name,
+        status: "skipped_interactive" as const,
+        lifecycleStatus: projection.kind,
+      };
+    }
+    return {
+      id: running.id,
+      subagent_id: running.id,
+      name: running.name,
+      status: "observed" as const,
+      lifecycleStatus: projection.kind,
+    };
+  });
+  const observedCount = statuses.filter((status) => status.status === "observed").length;
+  const skippedCount = statuses.filter((status) => status.status === "skipped_interactive").length;
+  return {
+    content: [{ type: "text" as const, text: `Observed ${observedCount} subagent(s); skipped ${skippedCount} interactive subagent(s).` }],
+    details: { status: "ok", agents: statuses },
+  };
+}
+
+async function executeSubagentStart(
+  params: Static<typeof SubagentParams>,
+  pi: ExtensionAPI,
+  ctx: any,
+  options: { includeSubagentId?: boolean } = {},
+) {
+  const currentAgent = process.env.PI_SUBAGENT_AGENT;
+  if (params.agent && currentAgent && params.agent === currentAgent) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `You are the ${currentAgent} agent - do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.`,
+        },
+      ],
+      details: { error: "self-spawn blocked" },
+    };
+  }
+
+  if (!isTerminalAvailable()) return muxUnavailableResult();
+
+  if (!ctx.sessionManager.getSessionFile()) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: "Error: no session file. Start pi with a persistent session to use subagents.",
+        },
+      ],
+      details: { error: "no session file" },
+    };
+  }
+
+  const parentThinking = pi.getThinkingLevel();
+  if (
+    parentThinking !== "off" &&
+    parentThinking !== "minimal" &&
+    parentThinking !== "low" &&
+    parentThinking !== "medium" &&
+    parentThinking !== "high" &&
+    parentThinking !== "xhigh" &&
+    parentThinking !== "max"
+  ) {
+    throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
+  }
+  const running = await launchSubagent(params, ctx, parentThinking);
+  const watcherAbort = new AbortController();
+  running.abortController = watcherAbort;
+  startWidgetRefresh();
+  startStatusRefresh(pi);
+
+  watchSubagent(running, watcherAbort.signal)
+    .then((result) => {
+      const basePresentation = resolveResultPresentation(result, running.name);
+      const presentation = running.runtimePlan?.runtimeMismatch
+        ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
+        : basePresentation;
+      if (!shouldDeliverSubagentCompletion(running)) {
+        running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+        runningSubagents.delete(running.id);
+        updateWidget();
+        return;
+      }
+      storeCompletedSubagentResult(running, result, presentation);
+      running.lifecycle = markDelivery(running.lifecycle, "delivered");
+      runningSubagents.delete(running.id);
+      updateWidget();
+      const completionApi = selectCompletionApi(pi, runtime.pi);
+      if (result.ping) {
+        const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+        completionApi.sendMessage(
+          {
+            customType: "subagent_ping",
+            content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+            display: true,
+            details: { name: result.ping.name, message: result.ping.message, agent: running.agent, sessionFile: result.sessionFile },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+        return;
+      }
+      completionApi.sendMessage(
+        {
+          customType: "subagent_result",
+          content: presentation,
+          display: true,
+          details: {
+            name: running.name,
+            task: running.task,
+            agent: running.agent,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
+            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+            ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    })
+    .catch((err) => {
+      const result: SubagentResult = {
+        name: running.name,
+        task: running.task,
+        summary: `Subagent error: ${err?.message ?? String(err)}`,
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+        error: err?.message ?? String(err),
+        sessionFile: running.sessionFile,
+      };
+      if (!shouldDeliverSubagentCompletion(running)) {
+        running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+        runningSubagents.delete(running.id);
+        updateWidget();
+        return;
+      }
+      storeCompletedSubagentResult(running, result);
+      running.lifecycle = markDelivery(running.lifecycle, "delivered");
+      runningSubagents.delete(running.id);
+      updateWidget();
+      selectCompletionApi(pi, runtime.pi).sendMessage(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: { name: running.name, task: running.task, error: err?.message },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    });
+
+  return createStartedSubagentResult(running, params, options);
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1092,6 +1531,12 @@ export const __test__ = {
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
+  normalizeAgentCompatParams,
+  handleGetSubagentResult,
+  handleSteerSubagent,
+  handlePingSubagents,
+  storeCompletedSubagentResult,
+  completedResults,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -1488,7 +1933,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
 
+    const preserveSubagents = shouldPreserveSubagentsOnShutdown((event as any).reason);
     cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
+    if (!preserveSubagents) {
+      completedResults.clear();
+    }
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1524,165 +1973,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        // Prevent self-spawning (e.g. planner spawning another planner)
-        const currentAgent = process.env.PI_SUBAGENT_AGENT;
-        if (params.agent && currentAgent && params.agent === currentAgent) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `You are the ${currentAgent} agent — do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.`,
-              },
-            ],
-            details: { error: "self-spawn blocked" },
-          };
-        }
-
-        // Validate prerequisites
-        if (!isTerminalAvailable()) {
-          return muxUnavailableResult();
-        }
-
-        if (!ctx.sessionManager.getSessionFile()) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Error: no session file. Start pi with a persistent session to use subagents.",
-              },
-            ],
-            details: { error: "no session file" },
-          };
-        }
-
-        // Launch the subagent (creates pane, sends command)
-        const parentThinking = pi.getThinkingLevel();
-        if (
-          parentThinking !== "off" &&
-          parentThinking !== "minimal" &&
-          parentThinking !== "low" &&
-          parentThinking !== "medium" &&
-          parentThinking !== "high" &&
-          parentThinking !== "xhigh" &&
-          parentThinking !== "max"
-        ) {
-          throw new Error(`Unsupported parent thinking level: ${parentThinking}`);
-        }
-        const running = await launchSubagent(params, ctx, parentThinking);
-
-        // Create a separate AbortController for the watcher
-        // (the tool's signal completes when we return)
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
-        // Start widget refresh and status supervision when the first agent launches
-        startWidgetRefresh();
-        startStatusRefresh(pi);
-
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
-              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-              runningSubagents.delete(running.id);
-              updateWidget();
-              return;
-            }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
-            const completionApi = selectCompletionApi(pi, runtime.pi);
-
-            if (result.ping) {
-              // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-              completionApi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    agent: running.agent,
-                    sessionFile: result.sessionFile,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const basePresentation = resolveResultPresentation(result, running.name);
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
-              : basePresentation;
-
-            completionApi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            if (!shouldDeliverSubagentCompletion(running)) {
-              running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-              runningSubagents.delete(running.id);
-              updateWidget();
-              return;
-            }
-            running.lifecycle = markDelivery(running.lifecycle, "delivered");
-            runningSubagents.delete(running.id);
-            updateWidget();
-            selectCompletionApi(pi, runtime.pi).sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
-
-        // Return immediately
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
-                `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
-                `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
-            },
-          ],
-          details: {
-            id: running.id,
-            name: params.name,
-            task: params.task,
-            agent: params.agent,
-            sessionFile: running.sessionFile,
-            launchScriptFile: running.launchScriptFile,
-            model: running.runtimePlan?.model,
-            thinking: running.runtimePlan?.thinking,
-            runtimePlan: running.runtimePlan,
-            status: "started",
-          },
-        };
+        return executeSubagentStart(params, pi, ctx);
       },
 
       renderCall(args, theme) {
@@ -1741,6 +2032,118 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fallback (shouldn't happen)
         const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── Agent compatibility tool ──
+  if (shouldRegister("Agent"))
+    pi.registerTool({
+      name: "Agent",
+      label: "Agent",
+      description:
+        "Compatibility alias for subagent(). Spawn a visible Pi sub-agent in a Herdr tab. " +
+        "Accepts Tintin/openccode-style fields: subagent_type or agent, prompt or task, description or name. " +
+        "Returns immediately; completion is delivered automatically as a steer message.",
+      promptSnippet:
+        "Use Agent({ subagent_type, prompt, description }) to spawn a visible Pi subagent in Herdr. " +
+        "This is async: do not poll or fabricate results; wait for the automatic steer completion.",
+      promptGuidelines: subagentRoutingGuidelines,
+      parameters: AgentCompatParams,
+
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const normalized = normalizeAgentCompatParams(params);
+        if ("error" in normalized) {
+          return { content: [{ type: "text" as const, text: normalized.error }], details: { error: normalized.error } };
+        }
+        return executeSubagentStart(normalized.params, pi, ctx, { includeSubagentId: true });
+      },
+
+      renderCall(args, theme) {
+        const partialArgs = args as Record<string, unknown>;
+        const name =
+          typeof partialArgs.description === "string" && partialArgs.description
+            ? partialArgs.description
+            : typeof partialArgs.name === "string" && partialArgs.name
+              ? partialArgs.name
+              : typeof partialArgs.subagent_type === "string" && partialArgs.subagent_type
+                ? partialArgs.subagent_type
+                : "Agent";
+        const agent = typeof partialArgs.subagent_type === "string" && partialArgs.subagent_type
+          ? theme.fg("dim", ` (${partialArgs.subagent_type})`)
+          : typeof partialArgs.agent === "string" && partialArgs.agent
+            ? theme.fg("dim", ` (${partialArgs.agent})`)
+            : "";
+        return new Text(theme.fg("accent", "▸") + " " + theme.fg("toolTitle", theme.bold(name)) + agent, 0, 0);
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.status === "started") {
+          return new Text(
+            theme.fg("accent", "▸") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? details.subagent_id ?? "Agent")) +
+              theme.fg("dim", " — started"),
+            0,
+            0,
+          );
+        }
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── get_subagent_result compatibility tool ──
+  if (shouldRegister("get_subagent_result"))
+    pi.registerTool({
+      name: "get_subagent_result",
+      label: "Get Subagent Result",
+      description:
+        "Compatibility status/result lookup for a known subagent by id or exact name. " +
+        "This is read-only and non-blocking; running agents report running, completed agents return the cached completion.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact subagent id" })),
+        subagent_id: Type.Optional(Type.String({ description: "Compatibility alias for id" })),
+        name: Type.Optional(Type.String({ description: "Exact subagent display name" })),
+      }),
+      async execute(_toolCallId, params) {
+        return handleGetSubagentResult(params);
+      },
+    });
+
+  // ── steer_subagent compatibility tool ──
+  if (shouldRegister("steer_subagent"))
+    pi.registerTool({
+      name: "steer_subagent",
+      label: "Steer Subagent",
+      description:
+        "Compatibility placeholder for steering a subagent by id or exact name. " +
+        "Direct terminal text steering is disabled as unsafe; use subagent_resume with the session file for follow-up.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        subagent_id: Type.Optional(Type.String({ description: "Compatibility alias for id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        message: Type.String({ description: "Message for compatibility; direct delivery is disabled as unsafe" }),
+      }),
+      async execute(_toolCallId, params) {
+        return handleSteerSubagent(params);
+      },
+    });
+
+  // ── ping_subagents compatibility tool ──
+  if (shouldRegister("ping_subagents"))
+    pi.registerTool({
+      name: "ping_subagents",
+      label: "Ping Subagents",
+      description:
+        "Send a lightweight status ping to running subagent panes. " +
+        "Interactive subagents are skipped by default unless includeInteractive is true.",
+      parameters: Type.Object({
+        includeInteractive: Type.Optional(Type.Boolean({ description: "Also ping interactive subagents" })),
+        message: Type.Optional(Type.String({ description: "Unsupported: custom ping delivery is disabled; use subagent_resume for follow-up instructions." })),
+      }),
+      async execute(_toolCallId, params) {
+        return handlePingSubagents(params);
       },
     });
 
@@ -1981,6 +2384,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
+        resumeEnvParts.push(`PI_DENY_TOOLS=${shellQuote([...SPAWNING_TOOLS].join(","))}`);
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
@@ -2020,12 +2424,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
+            const summary = findLastAssistantMessage(allEntries) ??
+              (result.errorMessage
+                ? `Subagent error: ${result.errorMessage}`
+                : result.exitCode !== 0
+                  ? `Resumed session exited with code ${result.exitCode}`
+                  : "Resumed session exited without new output");
+            const resultWithSummary = { ...result, summary, sessionFile: params.sessionPath };
+            const basePresentation = resolveResultPresentation(resultWithSummary, name);
+            const presentation = running.runtimePlan?.runtimeMismatch
+              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
+              : basePresentation;
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
               updateWidget();
               return;
             }
+            storeCompletedSubagentResult(running, resultWithSummary, presentation);
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
@@ -2049,21 +2466,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
-            const basePresentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
-              name,
-            );
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
-              : basePresentation;
-
             completionApi.sendMessage(
               {
                 customType: "subagent_result",
@@ -2083,12 +2485,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            const result: SubagentResult = {
+              name: running.name,
+              task: running.task,
+              summary: `Resume error: ${err?.message ?? String(err)}`,
+              exitCode: 1,
+              elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+              error: err?.message ?? String(err),
+              sessionFile: running.sessionFile,
+            };
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
               updateWidget();
               return;
             }
+            storeCompletedSubagentResult(running, result);
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
