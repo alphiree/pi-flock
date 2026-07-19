@@ -1165,21 +1165,25 @@ describe("subagent discovery", () => {
       const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
       assert.ok(resumeTool, "expected subagent_resume tool to be registered");
 
-      const result = await resumeTool.execute(
-        "resume-call",
-        { name, sessionPath, message },
-        new AbortController().signal,
-        () => {},
-        {
-          sessionManager: {
-            getSessionId: () => "parent-session",
-            getSessionDir: () => dir,
+      const executeResume = (resumeMessage: string) =>
+        resumeTool.execute(
+          "resume-call",
+          { name, sessionPath, message: resumeMessage },
+          new AbortController().signal,
+          () => {},
+          {
+            sessionManager: {
+              getSessionId: () => "parent-session",
+              getSessionDir: () => dir,
+            },
           },
-        },
-      );
+        );
+      const result = await executeResume(message);
+      const secondMessage = "a distinct resume message";
+      const secondResult = await executeResume(secondMessage);
 
-      assert.deepEqual(createdNames, [name]);
-      assert.deepEqual(dispatched.map((entry) => entry.paneId), ["mock-resume-surface"]);
+      assert.deepEqual(createdNames, [name, name]);
+      assert.deepEqual(dispatched.map((entry) => entry.paneId), ["mock-resume-surface", "mock-resume-surface"]);
       const script = readFileSync(result.details.launchScriptFile, "utf8");
       assertHostileValuesAreAbsentFromLaunchScriptMetadata(
         result.details.launchScriptFile,
@@ -1191,6 +1195,11 @@ describe("subagent discovery", () => {
       assert.ok(resumeMessagePath, "expected the resume message artifact argument");
       assert.match(basename(resumeMessagePath), /-[0-9a-f-]{36}\.md$/i);
       assert.equal(readFileSync(resumeMessagePath, "utf8"), message);
+      const secondScript = readFileSync(secondResult.details.launchScriptFile, "utf8");
+      const secondResumeMessagePath = secondScript.match(/'@([^']+)'/)?.[1];
+      assert.ok(secondResumeMessagePath, "expected the second resume message artifact argument");
+      assert.notEqual(secondResumeMessagePath, resumeMessagePath);
+      assert.equal(readFileSync(secondResumeMessagePath, "utf8"), secondMessage);
 
     } finally {
       for (const handler of shutdownHandlers) {
