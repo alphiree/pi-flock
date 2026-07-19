@@ -1487,6 +1487,32 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("uses the run ID to keep same-named prompt artifacts distinct", () => {
+    const testApi = (subagentsModule as any).__test__;
+    withTempDir((dir) => {
+      const params = {
+        name: "same worker",
+        task: "task",
+        systemPrompt: "caller instructions",
+      };
+      const agentDefs = { body: "agent instructions" };
+      const first = withMockedNow(1_700_000_000_000, () =>
+        testApi.createSystemPromptArtifacts(params, agentDefs, dir, "run-one"),
+      );
+      const second = withMockedNow(1_700_000_000_000, () =>
+        testApi.createSystemPromptArtifacts(params, agentDefs, dir, "run-two"),
+      );
+
+      assert.equal(first.length, 2);
+      assert.equal(second.length, 2);
+      assert.equal(new Set([...first, ...second]).size, 4);
+      assert.ok(first.every((path: string) => path.includes("run-one")));
+      assert.ok(second.every((path: string) => path.includes("run-two")));
+      assert.equal(readFileSync(first[0], "utf8"), "agent instructions");
+      assert.equal(readFileSync(second[1], "utf8"), "caller instructions");
+    });
+  });
+
   it("resolves auto-exit and interactive behavior for named and bare spawns", () => {
     // Autonomous named agents are not interactive, so the parent gets status pings.
     assert.equal(

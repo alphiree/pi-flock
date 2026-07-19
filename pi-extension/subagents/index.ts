@@ -1048,6 +1048,7 @@ function createSystemPromptArtifacts(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
   artifactDir: string,
+  runId: string,
 ): string[] {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const safeName = params.name
@@ -1063,7 +1064,7 @@ function createSystemPromptArtifacts(
 
   return prompts.flatMap(([source, content]) => {
     if (content === undefined) return [];
-    const path = join(artifactDir, "context", `${safeName}-${source}-sysprompt-${timestamp}.md`);
+    const path = join(artifactDir, "context", `${safeName}-${source}-sysprompt-${timestamp}-${runId}.md`);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, content, "utf8");
     return [path];
@@ -1077,6 +1078,7 @@ export const __test__ = {
   loadAgentDefaults,
   assertPiOnlyAgentDefinition,
   createPiLaunchScriptOptions,
+  createSystemPromptArtifacts,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -1228,7 +1230,7 @@ async function launchSubagent(
   // Append each source independently. Pi's --append-system-prompt accepts a
   // file path, avoiding shell escaping issues while retaining Pi's base prompt.
   // Agent instructions are always appended before caller instructions.
-  for (const systemPromptPath of createSystemPromptArtifacts(params, agentDefs, artifactDir)) {
+  for (const systemPromptPath of createSystemPromptArtifacts(params, agentDefs, artifactDir, id)) {
     parts.push("--append-system-prompt", shellQuote(systemPromptPath));
   }
 
