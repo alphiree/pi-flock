@@ -2875,6 +2875,26 @@ describe("tool registration", () => {
     flockNodes.clear();
   });
 
+  it("navigates the root flock with arrows and focuses the selected Herdr pane", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const flockNodes = testApi.flockNodes as Map<string, any>;
+    const focused: string[] = [];
+    const restoreTerminalHooks = terminalTest.setHooks({ focusPane: (paneId) => focused.push(paneId) } as any);
+    flockNodes.clear();
+    flockNodes.set("planner", { id: "planner", parentId: null, name: "Planner", surface: "pane-planner", state: "waiting", startTime: 1 });
+    flockNodes.set("worker", { id: "worker", parentId: "planner", name: "Worker", surface: "pane-worker", state: "active", startTime: 2 });
+    const ctx = { ui: { getEditorText: () => "", notify: () => {} } };
+    try {
+      assert.deepEqual(testApi.handleFleetInput("\u001b[B", ctx), { consume: true });
+      assert.deepEqual(testApi.handleFleetInput("\u001b[B", ctx), { consume: true });
+      assert.deepEqual(testApi.handleFleetInput("\r", ctx), { consume: true });
+      assert.deepEqual(focused, ["pane-worker"]);
+    } finally {
+      restoreTerminalHooks();
+      flockNodes.clear();
+    }
+  });
+
   it("formats child pane labels with a parent session prefix without changing agent name", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.equal(

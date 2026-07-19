@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, Text, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -653,6 +653,9 @@ interface SubagentRuntime {
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
+  fleetUnsubscribe?: () => void;
+  fleetActive?: boolean;
+  fleetSelectedId?: string;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
@@ -809,8 +812,7 @@ function formatLifecycleWidgetLabel(
   return " starting… ";
 }
 
-function renderFlockWidgetLines(nodes: FlockNode[], width: number): string[] {
-  const now = Date.now();
+function flattenFlockNodes(nodes: FlockNode[]): Array<{ node: FlockNode; depth: number }> {
   const children = new Map<string | null, FlockNode[]>();
   for (const node of nodes) {
     const list = children.get(node.parentId) ?? [];
@@ -826,6 +828,12 @@ function renderFlockWidgetLines(nodes: FlockNode[], width: number): string[] {
     }
   };
   visit(null, 0);
+  return rows;
+}
+
+function renderFlockWidgetLines(nodes: FlockNode[], width: number): string[] {
+  const now = Date.now();
+  const rows = flattenFlockNodes(nodes);
   const activeCount = rows.filter(({ node }) => node.state === "starting" || node.state === "active").length;
   const openCount = rows.length - rows.filter(({ node }) => node.state === "closed").length - activeCount;
   const info = activeCount > 0 ? openCount > 0 ? `${activeCount} active · ${openCount} open` : `${activeCount} active` : `${openCount} open`;
@@ -833,7 +841,10 @@ function renderFlockWidgetLines(nodes: FlockNode[], width: number): string[] {
   const lines = [borderTop("Subagents", info, width, accent)];
   for (const { node, depth } of rows) {
     const elapsed = formatElapsedMMSS(node.startTime, node.closedAt ?? now);
-    const prefix = depth === 0 ? " " : `${"  ".repeat(Math.max(0, depth - 1))} └─ `;
+    const selected = runtime.fleetActive && runtime.fleetSelectedId === node.id;
+    const prefix = depth === 0
+      ? selected ? " ⏺ " : " ◯ "
+      : `${"  ".repeat(Math.max(0, depth - 1))}${selected ? " ⏺─ " : " ◯─ "}`;
     const agentTag = node.agent ? ` (${node.agent})` : "";
     const left = `${prefix}${elapsed}  ${node.name}${agentTag} `;
     const right = ` ${node.state}${node.state === "closed" ? "" : "…"} `;
@@ -876,6 +887,65 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 
   lines.push(borderBottom(width, accent));
   return lines;
+}
+
+function getFleetNodes(): FlockNode[] {
+  return flattenFlockNodes(Array.from(flockNodes.values()))
+    .map(({ node }) => node)
+    .filter((node) => node.state !== "closed");
+}
+
+function deactivateFleet() {
+  runtime.fleetActive = false;
+  runtime.fleetSelectedId = undefined;
+  updateWidget();
+}
+
+function handleFleetInput(data: string, ctx: any): { consume?: boolean } | undefined {
+  if (process.env.PI_SUBAGENT_ID || isKeyRelease(data)) return undefined;
+  const nodes = getFleetNodes();
+  if (!runtime.fleetActive) {
+    if ((matchesKey(data, "down") || matchesKey(data, "left")) && nodes.length > 0 && ctx.ui.getEditorText() === "") {
+      runtime.fleetActive = true;
+      runtime.fleetSelectedId = nodes[0].id;
+      updateWidget();
+      return { consume: true };
+    }
+    return undefined;
+  }
+
+  const selectedIndex = Math.max(0, nodes.findIndex((node) => node.id === runtime.fleetSelectedId));
+  if (matchesKey(data, "down")) {
+    runtime.fleetSelectedId = nodes[Math.min(nodes.length - 1, selectedIndex + 1)]?.id;
+    updateWidget();
+    return { consume: true };
+  }
+  if (matchesKey(data, "up")) {
+    if (selectedIndex === 0) deactivateFleet();
+    else {
+      runtime.fleetSelectedId = nodes[selectedIndex - 1]?.id;
+      updateWidget();
+    }
+    return { consume: true };
+  }
+  if (matchesKey(data, "escape")) {
+    deactivateFleet();
+    return { consume: true };
+  }
+  if (matchesKey(data, Key.enter)) {
+    const selected = nodes[selectedIndex];
+    deactivateFleet();
+    if (!selected) return { consume: true };
+    try {
+      focusPane(selected.surface);
+    } catch (error) {
+      ctx.ui.notify(`Could not focus ${selected.name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+    return { consume: true };
+  }
+
+  deactivateFleet();
+  return undefined;
 }
 
 function updateWidget() {
@@ -1832,6 +1902,9 @@ export const __test__ = {
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   renderFlockWidgetLines,
+  flattenFlockNodes,
+  getFleetNodes,
+  handleFleetInput,
   orderFlockEvents,
   shouldRunStatusRefresh,
   markFlockNodeClosed,
@@ -2280,6 +2353,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
     const refreshedGuidelines = buildSubagentRoutingGuidelines(runtime.modelCatalog);
     subagentRoutingGuidelines.splice(0, subagentRoutingGuidelines.length, ...refreshedGuidelines);
+    if (!process.env.PI_SUBAGENT_ID && ctx.hasUI) {
+      runtime.fleetUnsubscribe?.();
+      runtime.fleetUnsubscribe = ctx.ui.onTerminalInput((data: string) => handleFleetInput(data, ctx));
+    }
     if (shouldRestoreFlockPresentation(runningSubagents.size, !!process.env.PI_SUBAGENT_ID, flockNodes.size)) {
       startWidgetRefresh();
       startStatusRefresh(pi);
@@ -2289,6 +2366,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    runtime.fleetUnsubscribe?.();
+    runtime.fleetUnsubscribe = undefined;
+    runtime.fleetActive = false;
+    runtime.fleetSelectedId = undefined;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -2961,33 +3042,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ? `Use subagent to fork an interactive session. fork: true, interactive: true, name: "Iterate", task: ${JSON.stringify(task)}`
         : `Use subagent to fork an interactive session. fork: true, interactive: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
       pi.sendUserMessage(toolCall);
-    },
-  });
-
-  pi.registerCommand("subagent_focus", {
-    description: "Focus a visible subagent by exact run id or name.",
-    handler: async (args, ctx) => {
-      if (process.env.PI_SUBAGENT_ID) {
-        ctx.ui.notify("Focus subagents from the root Pi session.", "warning");
-        return;
-      }
-      const target = args.trim();
-      const matches = Array.from(flockNodes.values()).filter((node) =>
-        node.state !== "closed" && (node.id === target || node.name === target),
-      );
-      if (!target) {
-        ctx.ui.notify("Usage: /subagent_focus <exact run id or name>", "warning");
-        return;
-      }
-      if (matches.length !== 1) {
-        ctx.ui.notify(matches.length ? "Ambiguous subagent name. Use its run id." : "No open tracked subagent found.", "warning");
-        return;
-      }
-      try {
-        focusPane(matches[0].surface);
-      } catch (error) {
-        ctx.ui.notify(`Could not focus ${matches[0].name}: ${error instanceof Error ? error.message : String(error)}`, "error");
-      }
     },
   });
 
