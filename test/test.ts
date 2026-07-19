@@ -1178,9 +1178,19 @@ describe("subagent discovery", () => {
             },
           },
         );
-      const result = await executeResume(message);
+      const originalNow = Date.now;
+      Date.now = () => 1_700_000_000_000;
+      let result: any;
+      let secondResult: any;
       const secondMessage = "a distinct resume message";
-      const secondResult = await executeResume(secondMessage);
+      try {
+        [result, secondResult] = await Promise.all([
+          executeResume(message),
+          executeResume(secondMessage),
+        ]);
+      } finally {
+        Date.now = originalNow;
+      }
 
       assert.deepEqual(createdNames, [name, name]);
       assert.deepEqual(dispatched.map((entry) => entry.paneId), ["mock-resume-surface", "mock-resume-surface"]);

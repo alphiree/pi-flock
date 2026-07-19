@@ -1960,7 +1960,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+          const msgTimestamp = new Date(Date.now()).toISOString().replace(/[:.]/g, "-").slice(0, 19);
           resumeMsgFile = join(
             artifactDir,
             "subagent-resume",
